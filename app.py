@@ -7,7 +7,6 @@ import time
 import json
 import os
 import logging
-from flask_socketio import SocketIO, emit
 import sqlite3
 import base64
 
