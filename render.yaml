@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: nos-mobile
+    name: whatsapp-clone
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
