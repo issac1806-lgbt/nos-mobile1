@@ -1,1003 +1,448 @@
-from flask import Flask, render_template_string, request, jsonify, session, send_file, send_from_directory
+from flask import Flask, render_template_string, request, jsonify, session
 import uuid
-from datetime import datetime, timedelta
-import threading
-import time
-import json
+from datetime import datetime
 import os
-import base64
-import re
-import logging
-from flask_socketio import SocketIO, emit, join_room, leave_room
-from werkzeug.utils import secure_filename
-from PIL import Image
+import json
 import sqlite3
-import io
-import random
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger('NOSComplete')
+from flask_socketio import SocketIO, emit, join_room
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'nos-complete-secure-2024'
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=30)
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
+app.config['SECRET_KEY'] = 'whatsapp-clone-secure-key'
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Create directories
-for folder in ['voice', 'images', 'videos', 'documents', 'avatars', 'group_icons', 'status', 'profiles']:
-    os.makedirs(f'uploads/{folder}', exist_ok=True)
+# Database setup
+def init_db():
+    conn = sqlite3.connect('whatsapp.db')
+    c = conn.cursor()
+    
+    # Users table
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (id TEXT PRIMARY KEY, username TEXT UNIQUE, display_name TEXT, 
+                  user_code TEXT UNIQUE, online INTEGER DEFAULT 0, last_seen TEXT,
+                  avatar_color TEXT, created_at TEXT)''')
+    
+    # Friend requests
+    c.execute('''CREATE TABLE IF NOT EXISTS friend_requests
+                 (id TEXT PRIMARY KEY, from_user_id TEXT, to_user_id TEXT,
+                  status TEXT DEFAULT 'pending', created_at TEXT)''')
+    
+    # Friends
+    c.execute('''CREATE TABLE IF NOT EXISTS friends
+                 (user_id TEXT, friend_id TEXT, created_at TEXT,
+                  PRIMARY KEY (user_id, friend_id))''')
+    
+    # Conversations
+    c.execute('''CREATE TABLE IF NOT EXISTS conversations
+                 (id TEXT PRIMARY KEY, name TEXT, is_group INTEGER DEFAULT 0,
+                  created_by TEXT, created_at TEXT)''')
+    
+    # Conversation participants
+    c.execute('''CREATE TABLE IF NOT EXISTS conversation_participants
+                 (conversation_id TEXT, user_id TEXT,
+                  PRIMARY KEY (conversation_id, user_id))''')
+    
+    # Messages
+    c.execute('''CREATE TABLE IF NOT EXISTS messages
+                 (id TEXT PRIMARY KEY, conversation_id TEXT, user_id TEXT,
+                  content TEXT, message_type TEXT DEFAULT 'text',
+                  timestamp TEXT, status TEXT DEFAULT 'sent')''')
+    
+    # Active calls
+    c.execute('''CREATE TABLE IF NOT EXISTS active_calls
+                 (id TEXT PRIMARY KEY, from_user_id TEXT, to_user_id TEXT,
+                  conversation_id TEXT, call_type TEXT, status TEXT,
+                  created_at TEXT)''')
+    
+    conn.commit()
+    conn.close()
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading', ping_timeout=60, ping_interval=25)
+init_db()
 
-class CompleteDatabase:
-    def __init__(self):
-        self.conn = sqlite3.connect('nos_complete.db', check_same_thread=False)
-        self.init_complete_tables()
-    
-    def init_complete_tables(self):
-        cursor = self.conn.cursor()
-        
-        # Enhanced users table
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            username TEXT UNIQUE,
-            phone_number TEXT UNIQUE,
-            display_name TEXT,
-            avatar_path TEXT,
-            status_text TEXT DEFAULT 'Hey there! I am using NOS',
-            online BOOLEAN DEFAULT FALSE,
-            last_seen DATETIME,
-            created_at DATETIME,
-            privacy_settings TEXT,
-            blocked_users TEXT,
-            theme TEXT DEFAULT 'light',
-            language TEXT DEFAULT 'en'
-        )
-        ''')
-        
-        # Enhanced messages table
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS messages (
-            id TEXT PRIMARY KEY,
-            conversation_id TEXT,
-            user_id TEXT,
-            message_type TEXT,
-            content TEXT,
-            file_path TEXT,
-            file_size INTEGER,
-            duration INTEGER,
-            thumbnail TEXT,
-            replied_to TEXT,
-            forwarded_from TEXT,
-            timestamp DATETIME,
-            status TEXT,
-            read_by TEXT,
-            disappearing BOOLEAN DEFAULT FALSE,
-            encryption_level INTEGER DEFAULT 0,
-            starred BOOLEAN DEFAULT FALSE,
-            reactions TEXT
-        )
-        ''')
-        
-        # Enhanced groups table
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS groups (
-            id TEXT PRIMARY KEY,
-            name TEXT,
-            description TEXT,
-            created_by TEXT,
-            avatar_path TEXT,
-            created_at DATETIME,
-            settings TEXT,
-            invite_link TEXT,
-            admin_only_messages BOOLEAN DEFAULT FALSE,
-            disappearing_messages BOOLEAN DEFAULT FALSE
-        )
-        ''')
-        
-        # Group members with roles
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS group_members (
-            group_id TEXT,
-            user_id TEXT,
-            role TEXT DEFAULT 'member',
-            joined_at DATETIME,
-            added_by TEXT,
-            PRIMARY KEY (group_id, user_id)
-        )
-        ''')
-        
-        # Contacts
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS contacts (
-            user_id TEXT,
-            contact_id TEXT,
-            name TEXT,
-            created_at DATETIME,
-            PRIMARY KEY (user_id, contact_id)
-        )
-        ''')
-        
-        # Status updates (24-hour stories)
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS status_updates (
-            id TEXT PRIMARY KEY,
-            user_id TEXT,
-            type TEXT,
-            file_path TEXT,
-            text_content TEXT,
-            background_color TEXT,
-            created_at DATETIME,
-            expires_at DATETIME,
-            views_count INTEGER DEFAULT 0,
-            viewers TEXT
-        )
-        ''')
-        
-        # Starred messages
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS starred_messages (
-            user_id TEXT,
-            message_id TEXT,
-            timestamp DATETIME,
-            PRIMARY KEY (user_id, message_id)
-        )
-        ''')
-        
-        # Broadcast lists
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS broadcast_lists (
-            id TEXT PRIMARY KEY,
-            user_id TEXT,
-            name TEXT,
-            recipients TEXT,
-            created_at DATETIME
-        )
-        ''')
-        
-        # Calls history
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS calls (
-            id TEXT PRIMARY KEY,
-            call_type TEXT,
-            participants TEXT,
-            duration INTEGER,
-            timestamp DATETIME,
-            status TEXT
-        )
-        ''')
-        
-        # Message reactions
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS message_reactions (
-            message_id TEXT,
-            user_id TEXT,
-            reaction TEXT,
-            timestamp DATETIME,
-            PRIMARY KEY (message_id, user_id)
-        )
-        ''')
-        
-        self.conn.commit()
-    
-    def save_user(self, user_data):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        INSERT OR REPLACE INTO users 
-        (id, username, phone_number, display_name, avatar_path, status_text, online, last_seen, created_at, privacy_settings, blocked_users, theme, language)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            user_data['id'],
-            user_data['username'],
-            user_data.get('phone_number'),
-            user_data.get('display_name'),
-            user_data.get('avatar_path'),
-            user_data.get('status_text', 'Hey there! I am using NOS'),
-            user_data.get('online', False),
-            user_data.get('last_seen'),
-            user_data.get('created_at'),
-            json.dumps(user_data.get('privacy_settings', {})),
-            json.dumps(user_data.get('blocked_users', [])),
-            user_data.get('theme', 'light'),
-            user_data.get('language', 'en')
-        ))
-        self.conn.commit()
-    
-    def get_user(self, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM users WHERE id = ?', (user_id,))
-        row = cursor.fetchone()
-        if row:
-            return {
-                'id': row[0],
-                'username': row[1],
-                'phone_number': row[2],
-                'display_name': row[3],
-                'avatar_path': row[4],
-                'status_text': row[5],
-                'online': bool(row[6]),
-                'last_seen': row[7],
-                'created_at': row[8],
-                'privacy_settings': json.loads(row[9]) if row[9] else {},
-                'blocked_users': json.loads(row[10]) if row[10] else [],
-                'theme': row[11],
-                'language': row[12]
-            }
-        return None
-    
-    def get_user_by_username(self, username):
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM users WHERE username = ?', (username,))
-        row = cursor.fetchone()
-        if row:
-            return {
-                'id': row[0],
-                'username': row[1],
-                'phone_number': row[2],
-                'display_name': row[3],
-                'avatar_path': row[4],
-                'status_text': row[5],
-                'online': bool(row[6]),
-                'last_seen': row[7],
-                'created_at': row[8],
-                'privacy_settings': json.loads(row[9]) if row[9] else {},
-                'blocked_users': json.loads(row[10]) if row[10] else []
-            }
-        return None
-    
-    def save_message(self, message_data):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        INSERT INTO messages 
-        (id, conversation_id, user_id, message_type, content, file_path, file_size, duration, thumbnail, replied_to, forwarded_from, timestamp, status, read_by, disappearing, encryption_level, reactions)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            message_data['id'],
-            message_data['conversation_id'],
-            message_data['user_id'],
-            message_data.get('message_type', 'text'),
-            message_data.get('content', ''),
-            message_data.get('file_path'),
-            message_data.get('file_size'),
-            message_data.get('duration'),
-            message_data.get('thumbnail'),
-            message_data.get('replied_to'),
-            message_data.get('forwarded_from'),
-            message_data.get('timestamp'),
-            message_data.get('status', 'sent'),
-            json.dumps(message_data.get('read_by', [])),
-            message_data.get('disappearing', False),
-            message_data.get('encryption_level', 0),
-            json.dumps(message_data.get('reactions', {}))
-        ))
-        self.conn.commit()
-    
-    def get_conversation_messages(self, conversation_id, limit=100):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        SELECT * FROM messages 
-        WHERE conversation_id = ? 
-        ORDER BY timestamp DESC 
-        LIMIT ?
-        ''', (conversation_id, limit))
-        rows = cursor.fetchall()
-        messages = []
-        for row in rows:
-            messages.append({
-                'id': row[0],
-                'conversation_id': row[1],
-                'user_id': row[2],
-                'message_type': row[3],
-                'content': row[4],
-                'file_path': row[5],
-                'file_size': row[6],
-                'duration': row[7],
-                'thumbnail': row[8],
-                'replied_to': row[9],
-                'forwarded_from': row[10],
-                'timestamp': row[11],
-                'status': row[12],
-                'read_by': json.loads(row[13]) if row[13] else [],
-                'disappearing': bool(row[14]),
-                'encryption_level': row[15],
-                'starred': bool(row[16]),
-                'reactions': json.loads(row[17]) if row[17] else {}
-            })
-        return messages[::-1]  # Reverse to get chronological order
-    
-    def create_group(self, group_data):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        INSERT INTO groups 
-        (id, name, description, created_by, avatar_path, created_at, settings, invite_link, admin_only_messages, disappearing_messages)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            group_data['id'],
-            group_data['name'],
-            group_data.get('description', ''),
-            group_data['created_by'],
-            group_data.get('avatar_path'),
-            group_data.get('created_at'),
-            json.dumps(group_data.get('settings', {})),
-            group_data.get('invite_link'),
-            group_data.get('admin_only_messages', False),
-            group_data.get('disappearing_messages', False)
-        ))
-        self.conn.commit()
-    
-    def add_group_member(self, group_id, user_id, role='member', added_by=None):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        INSERT OR REPLACE INTO group_members 
-        (group_id, user_id, role, joined_at, added_by)
-        VALUES (?, ?, ?, ?, ?)
-        ''', (group_id, user_id, role, datetime.now().isoformat(), added_by))
-        self.conn.commit()
-    
-    def get_user_groups(self, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        SELECT g.* FROM groups g
-        JOIN group_members gm ON g.id = gm.group_id
-        WHERE gm.user_id = ?
-        ''', (user_id,))
-        rows = cursor.fetchall()
-        groups = []
-        for row in rows:
-            groups.append({
-                'id': row[0],
-                'name': row[1],
-                'description': row[2],
-                'created_by': row[3],
-                'avatar_path': row[4],
-                'created_at': row[5],
-                'settings': json.loads(row[6]) if row[6] else {},
-                'invite_link': row[7],
-                'admin_only_messages': bool(row[8]),
-                'disappearing_messages': bool(row[9])
-            })
-        return groups
-    
-    def add_contact(self, user_id, contact_id, name=None):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        INSERT OR REPLACE INTO contacts 
-        (user_id, contact_id, name, created_at)
-        VALUES (?, ?, ?, ?)
-        ''', (user_id, contact_id, name, datetime.now().isoformat()))
-        self.conn.commit()
-    
-    def get_user_contacts(self, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        SELECT c.contact_id, u.username, u.display_name, u.avatar_path, u.status_text, u.online, u.last_seen
-        FROM contacts c
-        JOIN users u ON c.contact_id = u.id
-        WHERE c.user_id = ?
-        ''', (user_id,))
-        rows = cursor.fetchall()
-        contacts = []
-        for row in rows:
-            contacts.append({
-                'id': row[0],
-                'username': row[1],
-                'display_name': row[2],
-                'avatar_path': row[3],
-                'status_text': row[4],
-                'online': bool(row[5]),
-                'last_seen': row[6]
-            })
-        return contacts
-    
-    def star_message(self, user_id, message_id):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        INSERT OR REPLACE INTO starred_messages 
-        (user_id, message_id, timestamp)
-        VALUES (?, ?, ?)
-        ''', (user_id, message_id, datetime.now().isoformat()))
-        self.conn.commit()
-    
-    def get_starred_messages(self, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute('''
-        SELECT m.* FROM messages m
-        JOIN starred_messages sm ON m.id = sm.message_id
-        WHERE sm.user_id = ?
-        ORDER BY sm.timestamp DESC
-        ''', (user_id,))
-        rows = cursor.fetchall()
-        messages = []
-        for row in rows:
-            messages.append({
-                'id': row[0],
-                'conversation_id': row[1],
-                'user_id': row[2],
-                'message_type': row[3],
-                'content': row[4],
-                'file_path': row[5],
-                'file_size': row[6],
-                'duration': row[7],
-                'thumbnail': row[8],
-                'replied_to': row[9],
-                'forwarded_from': row[10],
-                'timestamp': row[11],
-                'status': row[12],
-                'read_by': json.loads(row[13]) if row[13] else [],
-                'disappearing': bool(row[14]),
-                'encryption_level': row[15],
-                'starred': bool(row[16]),
-                'reactions': json.loads(row[17]) if row[17] else {}
-            })
-        return messages
+def get_db():
+    conn = sqlite3.connect('whatsapp.db')
+    conn.row_factory = sqlite3.Row
+    return conn
 
-db = CompleteDatabase()
+# Utility functions
+def generate_user_code():
+    return str(uuid.uuid4())[:8].upper()
 
-# Sample data for demo
-def initialize_sample_data():
-    # Create sample users if they don't exist
-    sample_users = [
-        {
-            'id': 'user1',
-            'username': 'john_doe',
-            'display_name': 'John Doe',
-            'status_text': 'Available for calls',
-            'online': True
-        },
-        {
-            'id': 'user2', 
-            'username': 'jane_smith',
-            'display_name': 'Jane Smith',
-            'status_text': 'Busy right now',
-            'online': True
-        },
-        {
-            'id': 'user3',
-            'username': 'support',
-            'display_name': 'NOS Support',
-            'status_text': 'We are here to help!',
-            'online': True
-        }
-    ]
-    
-    for user_data in sample_users:
-        if not db.get_user(user_data['id']):
-            user_data.update({
-                'created_at': datetime.now().isoformat(),
-                'last_seen': datetime.now().isoformat(),
-                'privacy_settings': {'last_seen': 'everyone', 'profile_photo': 'everyone', 'status': 'everyone'},
-                'blocked_users': []
-            })
-            db.save_user(user_data)
-    
-    # Create sample group
-    sample_group = {
-        'id': 'group1',
-        'name': 'General Chat',
-        'description': 'Welcome to the general chat room',
-        'created_by': 'user1',
-        'created_at': datetime.now().isoformat(),
-        'settings': {},
-        'invite_link': f"https://nos.chat/join/{uuid.uuid4()}"
-    }
-    
-    # Check if group exists and create if not
-    cursor = db.conn.cursor()
-    cursor.execute('SELECT id FROM groups WHERE id = ?', ('group1',))
-    if not cursor.fetchone():
-        db.create_group(sample_group)
-        db.add_group_member('group1', 'user1', 'admin')
-        db.add_group_member('group1', 'user2', 'member')
-        db.add_group_member('group1', 'user3', 'member')
+def get_user_initial(name):
+    return name[0].upper() if name else 'U'
 
-# Initialize sample data
-initialize_sample_data()
+def get_avatar_color(user_id):
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F']
+    return colors[hash(user_id) % len(colors)]
 
+# Routes
 @app.route('/')
 def index():
-    return render_template_string('''
+    return '''
     <!DOCTYPE html>
-    <html lang="en">
+    <html>
     <head>
-        <meta charset="UTF-8">
+        <title>WhatsApp Clone</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>NOS - Complete Messenger</title>
         <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
         <style>
-            /* Complete WhatsApp-like CSS styles */
-            :root {
-                --primary-dark: #075E54;
-                --primary-main: #128C7E;
-                --primary-light: #25D366;
-                --accent-main: #34B7F1;
-                --background-main: #f0f0f0;
-                --surface-main: #ffffff;
-                --text-primary: #333333;
-                --text-secondary: #666666;
-                --border-light: #e0e0e0;
-                --status-online: #25D366;
-                --status-away: #FFC107;
-                --status-busy: #FF4444;
-            }
-
-            * {
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-                font-family: 'Segoe UI', system-ui, sans-serif;
-            }
-
-            body {
-                background: var(--background-main);
-                color: var(--text-primary);
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { 
+                font-family: 'Segoe UI', sans-serif; 
+                background: #111b21; 
+                color: white;
                 height: 100vh;
                 overflow: hidden;
             }
-
             .app-container {
                 display: flex;
                 height: 100vh;
-                max-width: 1400px;
+                max-width: 1600px;
                 margin: 0 auto;
-                background: var(--surface-main);
-                box-shadow: 0 0 20px rgba(0,0,0,0.1);
+                background: #222e35;
             }
-
-            /* Sidebar Styles */
             .sidebar {
-                width: 380px;
-                background: var(--surface-main);
-                border-right: 1px solid var(--border-light);
+                width: 400px;
+                background: #2a3942;
+                border-right: 1px solid #333;
                 display: flex;
                 flex-direction: column;
             }
-
             .sidebar-header {
                 padding: 20px;
-                background: var(--primary-main);
-                color: white;
+                background: #202c33;
                 display: flex;
                 align-items: center;
-                justify-content: space-between;
+                gap: 15px;
             }
-
-            .user-profile {
-                display: flex;
-                align-items: center;
-                gap: 12px;
-            }
-
             .user-avatar {
                 width: 50px;
                 height: 50px;
                 border-radius: 50%;
-                background: var(--primary-light);
                 display: flex;
                 align-items: center;
                 justify-content: center;
+                font-weight: bold;
+                font-size: 20px;
                 color: white;
-                font-weight: 600;
-                font-size: 18px;
-                cursor: pointer;
-                position: relative;
             }
-
-            .avatar-upload {
-                position: absolute;
-                bottom: -5px;
-                right: -5px;
-                background: var(--accent-main);
-                width: 20px;
-                height: 20px;
-                border-radius: 50%;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 12px;
-                cursor: pointer;
-            }
-
             .user-info {
                 flex: 1;
             }
-
             .user-name {
                 font-weight: 600;
-                font-size: 16px;
+                font-size: 18px;
             }
-
             .user-status {
-                font-size: 13px;
-                opacity: 0.9;
+                font-size: 14px;
+                color: #8696a0;
             }
-
+            .user-code {
+                font-size: 12px;
+                color: #00a884;
+                margin-top: 2px;
+            }
             .sidebar-tabs {
                 display: flex;
-                background: var(--primary-main);
+                background: #202c33;
             }
-
-            .sidebar-tab {
+            .tab {
                 flex: 1;
                 padding: 15px;
                 text-align: center;
-                color: white;
                 cursor: pointer;
                 border-bottom: 3px solid transparent;
-                transition: all 0.2s;
+                transition: all 0.3s;
             }
-
-            .sidebar-tab.active {
-                background: rgba(255,255,255,0.1);
-                border-bottom-color: white;
+            .tab.active {
+                border-bottom-color: #00a884;
+                color: #00a884;
             }
-
-            .search-container {
+            .search-box {
                 padding: 15px;
-                border-bottom: 1px solid var(--border-light);
+                background: #202c33;
             }
-
-            .search-input {
+            .search-box input {
                 width: 100%;
                 padding: 12px 20px;
-                border: 1px solid var(--border-light);
-                border-radius: 25px;
+                background: #2a3942;
+                border: none;
+                border-radius: 20px;
+                color: white;
                 font-size: 14px;
-                background: var(--background-main);
             }
-
-            .conversation-list {
+            .content-area {
                 flex: 1;
                 overflow-y: auto;
             }
-
-            .conversation-item {
+            .conversation-item, .friend-item {
                 padding: 15px;
-                border-bottom: 1px solid var(--border-light);
+                border-bottom: 1px solid #2a3942;
                 cursor: pointer;
-                transition: background 0.2s;
                 display: flex;
                 align-items: center;
-                gap: 12px;
+                gap: 15px;
+                transition: background 0.2s;
             }
-
-            .conversation-item:hover {
-                background: var(--background-main);
+            .conversation-item:hover, .friend-item:hover {
+                background: #2a3942;
             }
-
             .conversation-item.active {
-                background: #e8f4fd;
+                background: #2a3942;
             }
-
-            .conversation-avatar {
-                width: 50px;
-                height: 50px;
+            .item-avatar {
+                width: 55px;
+                height: 55px;
                 border-radius: 50%;
-                background: var(--primary-main);
                 display: flex;
                 align-items: center;
                 justify-content: center;
+                font-weight: bold;
+                font-size: 18px;
                 color: white;
-                font-weight: 600;
-                position: relative;
             }
-
-            .online-indicator {
-                position: absolute;
-                bottom: 2px;
-                right: 2px;
-                width: 12px;
-                height: 12px;
-                background: var(--status-online);
-                border: 2px solid white;
-                border-radius: 50%;
-            }
-
-            .conversation-info {
+            .item-info {
                 flex: 1;
             }
-
-            .conversation-header {
-                display: flex;
-                justify-content: space-between;
-                margin-bottom: 4px;
-            }
-
-            .conversation-name {
+            .item-name {
                 font-weight: 600;
-                font-size: 15px;
+                font-size: 16px;
+                margin-bottom: 5px;
             }
-
-            .conversation-time {
+            .item-preview {
+                font-size: 14px;
+                color: #8696a0;
+            }
+            .item-status {
                 font-size: 12px;
-                color: var(--text-secondary);
+                color: #00a884;
             }
-
-            .conversation-preview {
-                font-size: 13px;
-                color: var(--text-secondary);
-                display: flex;
-                align-items: center;
-                gap: 5px;
-            }
-
-            /* Chat Area Styles */
             .chat-area {
                 flex: 1;
                 display: flex;
                 flex-direction: column;
             }
-
             .chat-header {
                 padding: 15px 20px;
-                background: var(--surface-main);
-                border-bottom: 1px solid var(--border-light);
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-            }
-
-            .chat-participant {
+                background: #202c33;
+                border-bottom: 1px solid #2a3942;
                 display: flex;
                 align-items: center;
-                gap: 12px;
+                gap: 15px;
             }
-
-            .participant-name {
+            .chat-avatar {
+                width: 50px;
+                height: 50px;
+                border-radius: 50%;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-weight: bold;
+                font-size: 18px;
+                color: white;
+            }
+            .chat-info {
+                flex: 1;
+            }
+            .chat-name {
                 font-weight: 600;
-                font-size: 16px;
+                font-size: 18px;
             }
-
-            .participant-status {
-                font-size: 13px;
-                color: var(--text-secondary);
+            .chat-status {
+                font-size: 14px;
+                color: #8696a0;
             }
-
             .chat-actions {
                 display: flex;
                 gap: 10px;
             }
-
-            .action-button {
+            .action-btn {
                 width: 40px;
                 height: 40px;
                 border-radius: 50%;
                 border: none;
-                background: var(--background-main);
-                color: var(--text-primary);
+                background: #2a3942;
+                color: white;
                 cursor: pointer;
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                transition: background 0.2s;
             }
-
-            .action-button:hover {
-                background: var(--border-light);
-            }
-
-            .call-button {
-                background: var(--primary-light);
-                color: white;
-            }
-
-            .video-call-button {
-                background: var(--accent-main);
-                color: white;
-            }
-
-            .chat-messages {
+            .messages-container {
                 flex: 1;
                 padding: 20px;
                 overflow-y: auto;
-                background: var(--background-main);
-                display: flex;
-                flex-direction: column;
+                background: #0b141a;
+                background-image: url('data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100" opacity="0.03"><path fill="%2300a884" d="M50 0L100 50L50 100L0 50Z"/></svg>');
             }
-
             .message {
                 max-width: 65%;
                 margin-bottom: 15px;
                 padding: 12px 16px;
-                border-radius: 18px;
+                border-radius: 8px;
                 position: relative;
-                animation: messageAppear 0.3s ease-out;
+                animation: fadeIn 0.3s;
             }
-
-            @keyframes messageAppear {
+            @keyframes fadeIn {
                 from { opacity: 0; transform: translateY(10px); }
                 to { opacity: 1; transform: translateY(0); }
             }
-
             .message.sent {
-                background: var(--primary-light);
-                color: white;
-                align-self: flex-end;
-                border-bottom-right-radius: 5px;
+                background: #005c4b;
+                margin-left: auto;
+                border-top-right-radius: 0;
             }
-
             .message.received {
-                background: var(--surface-main);
-                color: var(--text-primary);
-                border: 1px solid var(--border-light);
-                align-self: flex-start;
-                border-bottom-left-radius: 5px;
+                background: #202c33;
+                margin-right: auto;
+                border-top-left-radius: 0;
             }
-
-            .message-header {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 5px;
-            }
-
-            .message-sender {
-                font-weight: 600;
-                font-size: 13px;
-            }
-
-            .message-time {
-                font-size: 11px;
-                opacity: 0.8;
-            }
-
             .message-content {
                 line-height: 1.4;
             }
-
-            .message-status {
-                display: flex;
-                justify-content: flex-end;
+            .message-time {
+                font-size: 11px;
+                color: #8696a0;
+                text-align: right;
                 margin-top: 5px;
-                font-size: 12px;
             }
-
-            .voice-message {
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                padding: 10px;
-                background: rgba(255,255,255,0.1);
-                border-radius: 10px;
-            }
-
-            .voice-play-button {
-                width: 30px;
-                height: 30px;
-                border-radius: 50%;
-                background: white;
-                color: var(--primary-main);
-                border: none;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-            }
-
-            .voice-duration {
-                font-size: 12px;
-                color: inherit;
-            }
-
-            /* Input Area Styles */
             .input-container {
                 padding: 15px 20px;
-                background: var(--surface-main);
-                border-top: 1px solid var(--border-light);
-            }
-
-            .input-wrapper {
+                background: #202c33;
                 display: flex;
-                align-items: flex-end;
-                gap: 10px;
+                align-items: center;
+                gap: 15px;
             }
-
             .input-actions {
                 display: flex;
-                gap: 5px;
+                gap: 10px;
             }
-
-            .input-action-button {
+            .input-action {
                 width: 40px;
                 height: 40px;
                 border-radius: 50%;
                 border: none;
-                background: var(--background-main);
-                color: var(--text-primary);
+                background: #2a3942;
+                color: white;
                 cursor: pointer;
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                transition: background 0.2s;
             }
-
-            .input-action-button:hover {
-                background: var(--border-light);
-            }
-
             .message-input {
                 flex: 1;
-                padding: 12px 16px;
-                border: 1px solid var(--border-light);
-                border-radius: 25px;
-                font-size: 14px;
+                padding: 12px 20px;
+                background: #2a3942;
+                border: none;
+                border-radius: 20px;
+                color: white;
+                font-size: 15px;
                 resize: none;
                 max-height: 120px;
-                background: var(--background-main);
             }
-
-            .send-button {
-                width: 44px;
-                height: 44px;
-                background: var(--primary-main);
-                color: white;
-                border: none;
+            .send-btn {
+                width: 45px;
+                height: 45px;
                 border-radius: 50%;
+                border: none;
+                background: #00a884;
+                color: white;
                 cursor: pointer;
-                transition: background 0.2s;
                 display: flex;
                 align-items: center;
                 justify-content: center;
             }
-
-            .send-button:hover {
-                background: var(--primary-dark);
-            }
-
-            .send-button:disabled {
-                background: var(--border-light);
-                cursor: not-allowed;
-            }
-
-            /* Voice Recorder */
-            .voice-recorder {
-                display: none;
-                position: fixed;
-                bottom: 80px;
-                left: 50%;
-                transform: translateX(-50%);
-                background: var(--primary-main);
-                color: white;
-                padding: 20px 30px;
-                border-radius: 25px;
-                text-align: center;
-                box-shadow: 0 5px 15px rgba(0,0,0,0.2);
-                z-index: 1000;
-            }
-
-            .recording-indicator {
+            .login-screen {
                 display: flex;
+                height: 100vh;
+                background: linear-gradient(135deg, #00a884 0%, #128c7e 100%);
                 align-items: center;
-                gap: 10px;
+                justify-content: center;
+            }
+            .login-box {
+                background: white;
+                padding: 40px;
+                border-radius: 15px;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+                width: 90%;
+                max-width: 400px;
+                text-align: center;
+            }
+            .login-title {
+                color: #128c7e;
+                font-size: 32px;
+                font-weight: bold;
                 margin-bottom: 10px;
             }
-
-            .recording-dot {
-                width: 12px;
-                height: 12px;
-                background: #ff4444;
+            .login-subtitle {
+                color: #666;
+                margin-bottom: 30px;
+            }
+            .login-input {
+                width: 100%;
+                padding: 15px;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                margin-bottom: 15px;
+                font-size: 16px;
+            }
+            .login-btn {
+                width: 100%;
+                padding: 15px;
+                background: #00a884;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                font-size: 16px;
+                font-weight: bold;
+                cursor: pointer;
+            }
+            .add-friend-btn {
+                position: fixed;
+                bottom: 20px;
+                right: 20px;
+                width: 60px;
+                height: 60px;
                 border-radius: 50%;
-                animation: pulse 1s infinite;
+                background: #00a884;
+                color: white;
+                border: none;
+                font-size: 24px;
+                cursor: pointer;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+                z-index: 1000;
             }
-
-            @keyframes pulse {
-                0% { opacity: 1; }
-                50% { opacity: 0.5; }
-                100% { opacity: 1; }
+            .friend-requests {
+                padding: 15px;
             }
-
-            .recording-time {
+            .friend-request-item {
+                background: #2a3942;
+                padding: 15px;
+                border-radius: 10px;
+                margin-bottom: 10px;
+                display: flex;
+                align-items: center;
+                gap: 15px;
+            }
+            .request-actions {
+                display: flex;
+                gap: 10px;
+                margin-left: auto;
+            }
+            .accept-btn, .decline-btn {
+                padding: 8px 15px;
+                border: none;
+                border-radius: 5px;
+                cursor: pointer;
                 font-size: 14px;
-                font-weight: 600;
             }
-
-            .recording-hint {
-                font-size: 12px;
-                opacity: 0.9;
+            .accept-btn {
+                background: #00a884;
+                color: white;
             }
-
-            /* Call Interface */
+            .decline-btn {
+                background: #ff4444;
+                color: white;
+            }
             .call-interface {
                 position: fixed;
                 top: 0;
@@ -1008,1775 +453,1025 @@ def index():
                 z-index: 2000;
                 display: none;
                 flex-direction: column;
+                align-items: center;
+                justify-content: center;
             }
-
-            .remote-video {
-                width: 100%;
-                height: 100%;
-                object-fit: cover;
-            }
-
-            .local-video {
-                position: absolute;
-                bottom: 100px;
-                right: 20px;
-                width: 120px;
-                height: 160px;
-                border-radius: 10px;
-                border: 2px solid white;
-            }
-
-            .call-info {
-                position: absolute;
-                top: 50px;
-                left: 0;
-                right: 0;
+            .caller-info {
                 text-align: center;
                 color: white;
+                margin-bottom: 30px;
             }
-
-            .call-participant {
+            .caller-name {
                 font-size: 24px;
-                font-weight: 600;
-                margin-bottom: 5px;
+                font-weight: bold;
+                margin-bottom: 10px;
             }
-
             .call-status {
                 font-size: 16px;
-                opacity: 0.9;
+                color: #8696a0;
             }
-
             .call-controls {
-                position: absolute;
-                bottom: 30px;
-                left: 0;
-                right: 0;
                 display: flex;
-                justify-content: center;
                 gap: 20px;
             }
-
-            .call-control-button {
+            .call-btn {
                 width: 60px;
                 height: 60px;
                 border-radius: 50%;
                 border: none;
-                background: rgba(255,255,255,0.2);
-                color: white;
                 cursor: pointer;
                 display: flex;
                 align-items: center;
                 justify-content: center;
                 font-size: 20px;
-                transition: background 0.2s;
             }
-
-            .call-control-button:hover {
-                background: rgba(255,255,255,0.3);
-            }
-
-            .call-control-button.end-call {
-                background: #ff4444;
-            }
-
-            .call-control-button.end-call:hover {
-                background: #cc0000;
-            }
-
-            /* Incoming Call */
-            .incoming-call {
-                position: fixed;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background: var(--primary-main);
-                z-index: 3000;
-                display: none;
-                flex-direction: column;
-                align-items: center;
-                justify-content: center;
-                color: white;
-            }
-
-            .caller-avatar {
-                width: 100px;
-                height: 100px;
-                border-radius: 50%;
-                background: var(--primary-light);
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 36px;
-                font-weight: 600;
-                margin-bottom: 20px;
-            }
-
-            .caller-name {
-                font-size: 24px;
-                font-weight: 600;
-                margin-bottom: 10px;
-            }
-
-            .call-type {
-                font-size: 16px;
-                opacity: 0.9;
-                margin-bottom: 30px;
-            }
-
-            .call-actions {
-                display: flex;
-                gap: 30px;
-            }
-
-            .call-action-button {
-                width: 70px;
-                height: 70px;
-                border-radius: 50%;
-                border: none;
-                cursor: pointer;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 24px;
-                transition: transform 0.2s;
-            }
-
-            .call-action-button:hover {
-                transform: scale(1.1);
-            }
-
             .accept-call {
-                background: var(--primary-light);
+                background: #00a884;
                 color: white;
             }
-
             .decline-call {
                 background: #ff4444;
                 color: white;
             }
-
-            /* Status View */
-            .status-view {
-                position: fixed;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background: black;
-                z-index: 4000;
-                display: none;
-            }
-
-            .status-header {
-                position: absolute;
-                top: 0;
-                left: 0;
-                right: 0;
-                padding: 20px;
-                background: linear-gradient(transparent, rgba(0,0,0,0.7));
+            .end-call {
+                background: #ff4444;
                 color: white;
-                z-index: 10;
-            }
-
-            .status-progress {
-                display: flex;
-                gap: 2px;
-                margin-bottom: 10px;
-            }
-
-            .status-progress-bar {
-                flex: 1;
-                height: 2px;
-                background: rgba(255,255,255,0.3);
-                border-radius: 1px;
-            }
-
-            .status-progress-bar.active {
-                background: white;
-            }
-
-            .status-user {
-                display: flex;
-                align-items: center;
-                gap: 10px;
-            }
-
-            .status-avatar {
-                width: 40px;
-                height: 40px;
-                border-radius: 50%;
-                background: var(--primary-main);
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                color: white;
-                font-weight: 600;
-            }
-
-            .status-content {
-                width: 100%;
-                height: 100%;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-            }
-
-            .status-image {
-                max-width: 100%;
-                max-height: 100%;
-                object-fit: contain;
-            }
-
-            .status-text {
-                color: white;
-                font-size: 24px;
-                text-align: center;
-                padding: 20px;
-            }
-
-            /* Modal Styles */
-            .modal {
-                position: fixed;
-                top: 0;
-                left: 0;
-                width: 100%;
-                height: 100%;
-                background: rgba(0,0,0,0.5);
-                z-index: 5000;
-                display: none;
-                align-items: center;
-                justify-content: center;
-            }
-
-            .modal-content {
-                background: white;
-                border-radius: 15px;
-                padding: 30px;
-                max-width: 500px;
-                width: 90%;
-                max-height: 80vh;
-                overflow-y: auto;
-            }
-
-            .modal-header {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                margin-bottom: 20px;
-            }
-
-            .modal-title {
-                font-size: 20px;
-                font-weight: 600;
-                color: var(--primary-main);
-            }
-
-            .close-modal {
-                background: none;
-                border: none;
-                font-size: 24px;
-                cursor: pointer;
-                color: var(--text-secondary);
-            }
-
-            /* Responsive Design */
-            @media (max-width: 768px) {
-                .sidebar {
-                    width: 100%;
-                }
-                
-                .chat-area {
-                    display: none;
-                }
-                
-                .chat-area.active {
-                    display: flex;
-                }
             }
         </style>
     </head>
     <body>
-        <!-- Login Screen -->
-        <div id="loginScreen" style="display: flex; height: 100vh; background: linear-gradient(135deg, var(--primary-main) 0%, var(--primary-dark) 100%); align-items: center; justify-content: center;">
-            <div style="background: white; padding: 40px; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); width: 100%; max-width: 400px;">
-                <div style="text-align: center; margin-bottom: 30px;">
-                    <div style="font-size: 32px; font-weight: 700; color: var(--primary-main); margin-bottom: 10px;">NOS</div>
-                    <div style="font-size: 14px; color: var(--text-secondary);">Complete Messenger</div>
-                </div>
-                <div style="margin-bottom: 20px;">
-                    <input type="text" id="usernameInput" placeholder="Your name" style="width: 100%; padding: 15px; border: 1px solid var(--border-light); border-radius: 8px; font-size: 16px; margin-bottom: 15px;">
-                    <input type="tel" id="phoneInput" placeholder="Phone number (optional)" style="width: 100%; padding: 15px; border: 1px solid var(--border-light); border-radius: 8px; font-size: 16px;">
-                </div>
-                <button onclick="registerUser()" style="width: 100%; padding: 15px; background: var(--primary-main); color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background 0.2s;">
-                    Get Started
-                </button>
-                <div style="margin-top: 25px; text-align: center;">
-                    <div style="font-size: 12px; color: var(--text-secondary); line-height: 1.5;">
-                        Voice & Video Calls • Group Chats • Voice Messages<br>
-                        File Sharing • End-to-End Encryption • Status Updates
-                    </div>
-                </div>
+        <div id="loginScreen" class="login-screen">
+            <div class="login-box">
+                <div class="login-title">WhatsApp</div>
+                <div class="login-subtitle">Complete Messenger with All Features</div>
+                <input type="text" id="usernameInput" class="login-input" placeholder="Enter your name">
+                <button onclick="login()" class="login-btn">Get Started</button>
             </div>
         </div>
 
-        <!-- Main App -->
         <div id="appContainer" class="app-container" style="display: none;">
-            <!-- Sidebar -->
             <div class="sidebar">
                 <div class="sidebar-header">
-                    <div class="user-profile">
-                        <div class="user-avatar" onclick="openProfileSettings()">
-                            <span id="userAvatarText">JD</span>
-                            <div class="avatar-upload" onclick="event.stopPropagation(); changeAvatar()">+</div>
-                        </div>
-                        <div class="user-info">
-                            <div class="user-name" id="userName">John Doe</div>
-                            <div class="user-status" id="userStatus">Online</div>
-                        </div>
-                    </div>
-                    <div class="header-actions">
-                        <button class="action-button" onclick="showStatusView()" title="Status">●</button>
-                        <button class="action-button" onclick="newChat()" title="New Chat">+</button>
-                        <button class="action-button" onclick="showSettings()" title="Menu">⋮</button>
+                    <div class="user-avatar" id="userAvatar" style="background: #FF6B6B;">U</div>
+                    <div class="user-info">
+                        <div class="user-name" id="userName">User</div>
+                        <div class="user-status" id="userStatus">Online</div>
+                        <div class="user-code" id="userCode">CODE: --------</div>
                     </div>
                 </div>
-
+                
                 <div class="sidebar-tabs">
-                    <div class="sidebar-tab active" onclick="switchTab('chats')">Chats</div>
-                    <div class="sidebar-tab" onclick="switchTab('status')">Status</div>
-                    <div class="sidebar-tab" onclick="switchTab('calls')">Calls</div>
-                    <div class="sidebar-tab" onclick="switchTab('contacts')">Contacts</div>
+                    <div class="tab active" onclick="switchTab('chats')">Chats</div>
+                    <div class="tab" onclick="switchTab('friends')">Friends</div>
+                    <div class="tab" onclick="switchTab('requests')">Requests</div>
                 </div>
-
-                <div class="search-container">
-                    <input type="text" class="search-input" placeholder="Search..." onkeyup="searchConversations(this.value)">
+                
+                <div class="search-box">
+                    <input type="text" id="searchInput" placeholder="Search...">
                 </div>
-
-                <div class="conversation-list" id="conversationList">
-                    <!-- Conversations will be loaded here -->
+                
+                <div class="content-area" id="contentArea">
+                    <!-- Content will be loaded here -->
                 </div>
             </div>
-
-            <!-- Chat Area -->
+            
             <div class="chat-area">
                 <div class="chat-header">
-                    <div class="chat-participant">
-                        <div class="conversation-avatar" id="chatAvatar">
-                            <span>GC</span>
-                            <div class="online-indicator" id="chatOnlineIndicator"></div>
-                        </div>
-                        <div class="participant-info">
-                            <div class="participant-name" id="chatParticipantName">Select a chat</div>
-                            <div class="participant-status" id="chatParticipantStatus">Tap on a conversation to start messaging</div>
-                        </div>
+                    <div class="chat-avatar" id="chatAvatar" style="background: #4ECDC4;">C</div>
+                    <div class="chat-info">
+                        <div class="chat-name" id="chatName">Select a chat</div>
+                        <div class="chat-status" id="chatStatus">Click on a conversation to start messaging</div>
                     </div>
                     <div class="chat-actions" id="chatActions" style="display: none;">
-                        <button class="action-button call-button" onclick="startVoiceCall()" title="Voice Call">📞</button>
-                        <button class="action-button video-call-button" onclick="startVideoCall()" title="Video Call">📹</button>
-                        <button class="action-button" onclick="showGroupManagement()" title="Group Info" id="groupInfoButton" style="display: none;">ⓘ</button>
-                        <button class="action-button" onclick="searchInChat()" title="Search">🔍</button>
+                        <button class="action-btn" onclick="startVoiceCall()" title="Voice call">📞</button>
+                        <button class="action-btn" onclick="startVideoCall()" title="Video call">📹</button>
                     </div>
                 </div>
-
-                <div class="chat-messages" id="chatMessages">
-                    <div style="text-align: center; color: var(--text-secondary); padding: 40px; font-size: 14px;">
+                
+                <div class="messages-container" id="messagesContainer">
+                    <div style="text-align: center; color: #8696a0; padding: 40px;">
                         Select a conversation to start messaging
                     </div>
                 </div>
-
+                
                 <div class="input-container" id="inputContainer" style="display: none;">
-                    <div class="input-wrapper">
-                        <div class="input-actions">
-                            <button class="input-action-button" onclick="toggleVoiceRecorder()" title="Voice Message">🎤</button>
-                            <button class="input-action-button" onclick="attachFile()" title="Attach File">📎</button>
-                            <button class="input-action-button" onclick="attachImage()" title="Attach Image">📷</button>
-                            <button class="input-action-button" onclick="attachContact()" title="Share Contact">👤</button>
-                            <button class="input-action-button" onclick="attachLocation()" title="Share Location">📍</button>
-                        </div>
-                        <textarea class="message-input" id="messageInput" placeholder="Type a message..." rows="1"></textarea>
-                        <button class="send-button" onclick="sendMessage()" id="sendButton" disabled>➤</button>
+                    <div class="input-actions">
+                        <button class="input-action" title="Emoji">😊</button>
+                        <button class="input-action" title="Attach">📎</button>
                     </div>
+                    <textarea class="message-input" id="messageInput" placeholder="Type a message..." rows="1"></textarea>
+                    <button class="send-btn" onclick="sendMessage()" title="Send">➤</button>
                 </div>
             </div>
-        </div>
-
-        <!-- Voice Recorder -->
-        <div id="voiceRecorder" class="voice-recorder">
-            <div class="recording-indicator">
-                <div class="recording-dot"></div>
-                <div class="recording-time" id="recordingTime">0:00</div>
-            </div>
-            <div class="recording-hint">Recording... Release to send</div>
         </div>
 
         <!-- Call Interface -->
         <div id="callInterface" class="call-interface">
-            <video id="remoteVideo" class="remote-video" autoplay playsinline></video>
-            <video id="localVideo" class="local-video" autoplay playsinline muted></video>
-            <div class="call-info">
-                <div class="call-participant" id="callParticipantName">John Doe</div>
+            <div class="caller-info">
+                <div class="caller-name" id="callerName">John Doe</div>
                 <div class="call-status" id="callStatus">Calling...</div>
             </div>
             <div class="call-controls">
-                <button class="call-control-button" onclick="toggleMute()" id="muteButton">🎤</button>
-                <button class="call-control-button" onclick="toggleVideo()" id="videoButton">📹</button>
-                <button class="call-control-button" onclick="toggleSpeaker()" id="speakerButton">🔊</button>
-                <button class="call-control-button end-call" onclick="endCall()">📞</button>
+                <button class="call-btn accept-call" onclick="answerCall(true)">📞</button>
+                <button class="call-btn decline-call" onclick="answerCall(false)">📞</button>
+                <button class="call-btn end-call" onclick="endCall()" style="display: none;">📞</button>
             </div>
         </div>
 
-        <!-- Incoming Call -->
-        <div id="incomingCall" class="incoming-call">
-            <div class="caller-avatar" id="incomingCallerAvatar">JD</div>
-            <div class="caller-name" id="incomingCallerName">John Doe</div>
-            <div class="call-type" id="incomingCallType">Incoming Voice Call</div>
-            <div class="call-actions">
-                <button class="call-action-button decline-call" onclick="answerCall(false)">📞</button>
-                <button class="call-action-button accept-call" onclick="answerCall(true)">📞</button>
-            </div>
-        </div>
-
-        <!-- Status View -->
-        <div id="statusView" class="status-view">
-            <div class="status-header">
-                <div class="status-progress" id="statusProgress"></div>
-                <div class="status-user">
-                    <div class="status-avatar" id="statusUserAvatar">JD</div>
-                    <div>
-                        <div class="user-name" id="statusUserName">John Doe</div>
-                        <div class="status-time" id="statusTime">Just now</div>
-                    </div>
-                </div>
-            </div>
-            <div class="status-content" id="statusContent"></div>
-        </div>
-
-        <!-- Settings Modal -->
-        <div id="settingsModal" class="modal">
-            <div class="modal-content">
-                <div class="modal-header">
-                    <div class="modal-title">Settings</div>
-                    <button class="close-modal" onclick="closeSettings()">×</button>
-                </div>
-                <div class="settings-options">
-                    <div class="setting-item" onclick="openProfileSettings()">
-                        <div class="setting-icon">👤</div>
-                        <div class="setting-text">Profile</div>
-                    </div>
-                    <div class="setting-item" onclick="openPrivacySettings()">
-                        <div class="setting-icon">🔒</div>
-                        <div class="setting-text">Privacy</div>
-                    </div>
-                    <div class="setting-item" onclick="openChatSettings()">
-                        <div class="setting-icon">💬</div>
-                        <div class="setting-text">Chats</div>
-                    </div>
-                    <div class="setting-item" onclick="openNotificationSettings()">
-                        <div class="setting-icon">🔔</div>
-                        <div class="setting-text">Notifications</div>
-                    </div>
-                    <div class="setting-item" onclick="openStorageSettings()">
-                        <div class="setting-icon">💾</div>
-                        <div class="setting-text">Storage and Data</div>
-                    </div>
-                    <div class="setting-item" onclick="openHelp()">
-                        <div class="setting-icon">❓</div>
-                        <div class="setting-text">Help</div>
-                    </div>
-                    <div class="setting-item" onclick="logout()">
-                        <div class="setting-icon">🚪</div>
-                        <div class="setting-text">Log Out</div>
-                    </div>
-                </div>
-            </div>
-        </div>
+        <button class="add-friend-btn" onclick="showAddFriend()" title="Add Friend">+</button>
 
         <script>
-            // Complete NOS Messenger JavaScript Implementation
             let currentUser = null;
             let socket = null;
             let currentConversation = null;
-            let peerConnection = null;
-            let localStream = null;
-            let remoteStream = null;
             let currentCall = null;
-            let mediaRecorder = null;
-            let audioChunks = [];
-            let recordingInterval = null;
-            let recordingTime = 0;
-            let isRecording = false;
             let conversations = [];
-            let statusUpdates = [];
+            let friends = [];
+            let friendRequests = [];
 
-            // WebRTC Configuration
-            const configuration = {
-                iceServers: [
-                    { urls: 'stun:stun.l.google.com:19302' },
-                    { urls: 'stun:stun1.l.google.com:19302' },
-                    { urls: 'stun:stun2.l.google.com:19302' },
-                    { urls: 'stun:stun3.l.google.com:19302' }
-                ]
-            };
-
-            // Initialize App
+            // Initialize app
             function initApp() {
-                checkAutoLogin();
-                setupEventListeners();
-            }
-
-            function checkAutoLogin() {
-                const savedUser = localStorage.getItem('nosUser');
+                const savedUser = localStorage.getItem('whatsappUser');
                 if (savedUser) {
                     currentUser = JSON.parse(savedUser);
-                    showAppInterface();
-                    connectWebSocket();
-                    loadConversations();
-                    loadStatusUpdates();
+                    showApp();
+                    connectSocket();
+                    loadData();
                 }
             }
 
-            function setupEventListeners() {
-                // Message input auto-resize
-                const messageInput = document.getElementById('messageInput');
-                messageInput.addEventListener('input', function() {
-                    this.style.height = 'auto';
-                    this.style.height = (this.scrollHeight) + 'px';
-                    document.getElementById('sendButton').disabled = this.value.trim() === '';
+            function login() {
+                const username = document.getElementById('usernameInput').value.trim();
+                if (!username) {
+                    alert('Please enter your name');
+                    return;
+                }
+
+                fetch('/api/login', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({username: username})
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        currentUser = data.user;
+                        localStorage.setItem('whatsappUser', JSON.stringify(data.user));
+                        showApp();
+                        connectSocket();
+                        loadData();
+                    } else {
+                        alert('Error: ' + data.error);
+                    }
+                });
+            }
+
+            function showApp() {
+                document.getElementById('loginScreen').style.display = 'none';
+                document.getElementById('appContainer').style.display = 'flex';
+                
+                document.getElementById('userName').textContent = currentUser.display_name;
+                document.getElementById('userAvatar').textContent = currentUser.display_name.charAt(0).toUpperCase();
+                document.getElementById('userAvatar').style.background = currentUser.avatar_color;
+                document.getElementById('userCode').textContent = 'CODE: ' + currentUser.user_code;
+                document.getElementById('userStatus').textContent = 'Online';
+
+                loadConversations();
+            }
+
+            function connectSocket() {
+                socket = io({query: {user_id: currentUser.id}});
+                
+                socket.on('connect', () => {
+                    console.log('Connected to server');
+                    updateOnlineStatus(true);
                 });
 
-                // Enter key to send message
-                messageInput.addEventListener('keypress', function(e) {
+                socket.on('new_message', handleNewMessage);
+                socket.on('friend_request', handleFriendRequest);
+                socket.on('friend_request_accepted', handleFriendRequestAccepted);
+                socket.on('incoming_call', handleIncomingCall);
+                socket.on('call_accepted', handleCallAccepted);
+                socket.on('call_ended', handleCallEnded);
+            }
+
+            function loadData() {
+                loadConversations();
+                loadFriends();
+                loadFriendRequests();
+            }
+
+            function loadConversations() {
+                fetch('/api/conversations?user_id=' + currentUser.id)
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        conversations = data.conversations;
+                        renderConversations();
+                    }
+                });
+            }
+
+            function loadFriends() {
+                fetch('/api/friends?user_id=' + currentUser.id)
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        friends = data.friends;
+                    }
+                });
+            }
+
+            function loadFriendRequests() {
+                fetch('/api/friend_requests?user_id=' + currentUser.id)
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        friendRequests = data.requests;
+                    }
+                });
+            }
+
+            function renderConversations() {
+                const container = document.getElementById('contentArea');
+                container.innerHTML = conversations.map(conv => `
+                    <div class="conversation-item" onclick="selectConversation('${conv.id}')">
+                        <div class="item-avatar" style="background: ${conv.avatar_color || '#4ECDC4'};">${conv.name.charAt(0).toUpperCase()}</div>
+                        <div class="item-info">
+                            <div class="item-name">${conv.name}</div>
+                            <div class="item-preview">${conv.last_message || 'No messages yet'}</div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            function renderFriends() {
+                const container = document.getElementById('contentArea');
+                container.innerHTML = friends.map(friend => `
+                    <div class="friend-item" onclick="startChatWithFriend('${friend.id}')">
+                        <div class="item-avatar" style="background: ${friend.avatar_color || '#45B7D1'};">${friend.display_name.charAt(0).toUpperCase()}</div>
+                        <div class="item-info">
+                            <div class="item-name">${friend.display_name}</div>
+                            <div class="item-status">${friend.online ? 'Online' : 'Offline'}</div>
+                            <div class="item-preview">Code: ${friend.user_code}</div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            function renderFriendRequests() {
+                const container = document.getElementById('contentArea');
+                if (friendRequests.length === 0) {
+                    container.innerHTML = '<div style="text-align: center; color: #8696a0; padding: 40px;">No pending friend requests</div>';
+                    return;
+                }
+
+                container.innerHTML = friendRequests.map(req => `
+                    <div class="friend-request-item">
+                        <div class="item-avatar" style="background: ${req.from_avatar_color || '#FF6B6B'};">${req.from_display_name.charAt(0).toUpperCase()}</div>
+                        <div class="item-info">
+                            <div class="item-name">${req.from_display_name}</div>
+                            <div class="item-preview">Wants to be your friend</div>
+                        </div>
+                        <div class="request-actions">
+                            <button class="accept-btn" onclick="respondToRequest('${req.id}', true)">Accept</button>
+                            <button class="decline-btn" onclick="respondToRequest('${req.id}', false)">Decline</button>
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            function switchTab(tabName) {
+                document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+                event.target.classList.add('active');
+
+                if (tabName === 'chats') {
+                    renderConversations();
+                } else if (tabName === 'friends') {
+                    renderFriends();
+                } else if (tabName === 'requests') {
+                    renderFriendRequests();
+                }
+            }
+
+            function selectConversation(conversationId) {
+                currentConversation = conversations.find(c => c.id === conversationId);
+                if (!currentConversation) return;
+
+                document.getElementById('chatName').textContent = currentConversation.name;
+                document.getElementById('chatAvatar').textContent = currentConversation.name.charAt(0).toUpperCase();
+                document.getElementById('chatAvatar').style.background = currentConversation.avatar_color || '#4ECDC4';
+                document.getElementById('chatStatus').textContent = 'Online';
+                document.getElementById('chatActions').style.display = 'flex';
+                document.getElementById('inputContainer').style.display = 'flex';
+
+                loadMessages(conversationId);
+            }
+
+            function loadMessages(conversationId) {
+                fetch('/api/messages/' + conversationId)
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        renderMessages(data.messages);
+                    }
+                });
+            }
+
+            function renderMessages(messages) {
+                const container = document.getElementById('messagesContainer');
+                container.innerHTML = messages.map(msg => `
+                    <div class="message ${msg.user_id === currentUser.id ? 'sent' : 'received'}">
+                        <div class="message-content">${msg.content}</div>
+                        <div class="message-time">${formatTime(msg.timestamp)}</div>
+                    </div>
+                `).join('');
+                
+                container.scrollTop = container.scrollHeight;
+            }
+
+            function sendMessage() {
+                const input = document.getElementById('messageInput');
+                const content = input.value.trim();
+                
+                if (!content || !currentConversation) return;
+
+                const messageData = {
+                    id: 'msg_' + Date.now(),
+                    conversation_id: currentConversation.id,
+                    user_id: currentUser.id,
+                    content: content,
+                    timestamp: new Date().toISOString()
+                };
+
+                // Add to UI immediately
+                addMessageToUI(messageData, true);
+                input.value = '';
+
+                // Send to server
+                fetch('/api/send_message', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(messageData)
+                });
+
+                if (socket) {
+                    socket.emit('send_message', messageData);
+                }
+            }
+
+            function addMessageToUI(messageData, isSent) {
+                const container = document.getElementById('messagesContainer');
+                const placeholder = container.querySelector('div[style]');
+                if (placeholder) placeholder.remove();
+
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message ${isSent ? 'sent' : 'received'}`;
+                messageDiv.innerHTML = `
+                    <div class="message-content">${messageData.content}</div>
+                    <div class="message-time">${formatTime(messageData.timestamp)}</div>
+                `;
+                
+                container.appendChild(messageDiv);
+                container.scrollTop = container.scrollHeight;
+            }
+
+            function handleNewMessage(data) {
+                if (currentConversation && data.conversation_id === currentConversation.id) {
+                    addMessageToUI(data.message, false);
+                }
+            }
+
+            function showAddFriend() {
+                const userCode = prompt('Enter friend\'s code:');
+                if (userCode) {
+                    fetch('/api/send_friend_request', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            from_user_id: currentUser.id,
+                            to_user_code: userCode
+                        })
+                    })
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.success) {
+                            alert('Friend request sent!');
+                            loadFriendRequests();
+                        } else {
+                            alert('Error: ' + data.error);
+                        }
+                    });
+                }
+            }
+
+            function respondToRequest(requestId, accept) {
+                fetch('/api/respond_friend_request', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        request_id: requestId,
+                        accept: accept
+                    })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        loadFriendRequests();
+                        loadFriends();
+                        if (accept) {
+                            alert('Friend added successfully!');
+                        }
+                    }
+                });
+            }
+
+            function handleFriendRequest(data) {
+                loadFriendRequests();
+                alert(`New friend request from ${data.from_user.display_name}`);
+            }
+
+            function handleFriendRequestAccepted(data) {
+                loadFriends();
+                alert(`${data.friend.display_name} accepted your friend request!`);
+            }
+
+            function startChatWithFriend(friendId) {
+                fetch('/api/create_conversation', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        user_id: currentUser.id,
+                        friend_id: friendId
+                    })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        loadConversations();
+                        // Switch to chats tab and select the conversation
+                        document.querySelectorAll('.tab')[0].click();
+                        // You might want to automatically select the new conversation here
+                    }
+                });
+            }
+
+            function startVoiceCall() {
+                if (!currentConversation) return;
+                
+                fetch('/api/start_call', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        from_user_id: currentUser.id,
+                        conversation_id: currentConversation.id,
+                        call_type: 'voice'
+                    })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        currentCall = data.call;
+                        showCallInterface('outgoing');
+                    }
+                });
+            }
+
+            function startVideoCall() {
+                if (!currentConversation) return;
+                
+                fetch('/api/start_call', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        from_user_id: currentUser.id,
+                        conversation_id: currentConversation.id,
+                        call_type: 'video'
+                    })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        currentCall = data.call;
+                        showCallInterface('outgoing');
+                    }
+                });
+            }
+
+            function handleIncomingCall(data) {
+                currentCall = data.call;
+                document.getElementById('callerName').textContent = data.caller.display_name;
+                document.getElementById('callStatus').textContent = `Incoming ${data.call.call_type} call`;
+                showCallInterface('incoming');
+            }
+
+            function showCallInterface(type) {
+                const callInterface = document.getElementById('callInterface');
+                const acceptBtn = callInterface.querySelector('.accept-call');
+                const declineBtn = callInterface.querySelector('.decline-call');
+                const endBtn = callInterface.querySelector('.end-call');
+                
+                if (type === 'incoming') {
+                    acceptBtn.style.display = 'flex';
+                    declineBtn.style.display = 'flex';
+                    endBtn.style.display = 'none';
+                    document.getElementById('callStatus').textContent = 'Incoming call';
+                } else {
+                    acceptBtn.style.display = 'none';
+                    declineBtn.style.display = 'none';
+                    endBtn.style.display = 'flex';
+                    document.getElementById('callStatus').textContent = 'Calling...';
+                }
+                
+                callInterface.style.display = 'flex';
+            }
+
+            function answerCall(accept) {
+                if (!currentCall) return;
+                
+                fetch('/api/answer_call', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        call_id: currentCall.id,
+                        accept: accept
+                    })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        if (accept) {
+                            document.getElementById('callStatus').textContent = 'Call connected';
+                            document.querySelector('.accept-call').style.display = 'none';
+                            document.querySelector('.decline-call').style.display = 'none';
+                            document.querySelector('.end-call').style.display = 'flex';
+                        } else {
+                            hideCallInterface();
+                        }
+                    }
+                });
+            }
+
+            function endCall() {
+                if (!currentCall) return;
+                
+                fetch('/api/end_call', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        call_id: currentCall.id
+                    })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    hideCallInterface();
+                });
+            }
+
+            function handleCallAccepted(data) {
+                document.getElementById('callStatus').textContent = 'Call connected';
+                document.querySelector('.accept-call').style.display = 'none';
+                document.querySelector('.decline-call').style.display = 'none';
+                document.querySelector('.end-call').style.display = 'flex';
+            }
+
+            function handleCallEnded(data) {
+                hideCallInterface();
+                alert('Call ended');
+            }
+
+            function hideCallInterface() {
+                document.getElementById('callInterface').style.display = 'none';
+                currentCall = null;
+            }
+
+            function formatTime(timestamp) {
+                const date = new Date(timestamp);
+                return date.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+            }
+
+            function updateOnlineStatus(online) {
+                if (socket) {
+                    socket.emit('user_status', {online: online});
+                }
+            }
+
+            // Auto-resize textarea and enter to send
+            document.addEventListener('DOMContentLoaded', function() {
+                const textarea = document.getElementById('messageInput');
+                textarea.addEventListener('input', function() {
+                    this.style.height = 'auto';
+                    this.style.height = (this.scrollHeight) + 'px';
+                });
+
+                textarea.addEventListener('keypress', function(e) {
                     if (e.key === 'Enter' && !e.shiftKey) {
                         e.preventDefault();
                         sendMessage();
                     }
                 });
 
-                // Typing indicators
-                messageInput.addEventListener('input', function() {
-                    if (socket && currentConversation) {
-                        socket.emit('typing', {
-                            conversation_id: currentConversation.id,
-                            typing: true
-                        });
-                    }
-                });
-
-                messageInput.addEventListener('blur', function() {
-                    if (socket && currentConversation) {
-                        socket.emit('typing', {
-                            conversation_id: currentConversation.id,
-                            typing: false
-                        });
-                    }
-                });
-
-                // Voice recorder touch events
-                document.addEventListener('touchstart', startVoiceRecording);
-                document.addEventListener('touchend', stopVoiceRecording);
-                document.addEventListener('mousedown', startVoiceRecording);
-                document.addEventListener('mouseup', stopVoiceRecording);
-            }
-
-            // User Registration
-            function registerUser() {
-                const username = document.getElementById('usernameInput').value.trim();
-                const phone = document.getElementById('phoneInput').value.trim();
-
-                if (!username) {
-                    alert('Please enter your name');
-                    return;
-                }
-
-                fetch('/register', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        username: username,
-                        phone_number: phone
-                    })
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        currentUser = data.user;
-                        localStorage.setItem('nosUser', JSON.stringify(data.user));
-                        showAppInterface();
-                        connectWebSocket();
-                        loadConversations();
-                        loadStatusUpdates();
-                    } else {
-                        alert('Error: ' + data.error);
-                    }
-                })
-                .catch(error => {
-                    console.error('Registration error:', error);
-                    alert('Registration failed. Please try again.');
-                });
-            }
-
-            function showAppInterface() {
-                document.getElementById('loginScreen').style.display = 'none';
-                document.getElementById('appContainer').style.display = 'flex';
-
-                // Update user info
-                document.getElementById('userName').textContent = currentUser.display_name || currentUser.username;
-                document.getElementById('userAvatarText').textContent = getInitials(currentUser.display_name || currentUser.username);
-                document.getElementById('userStatus').textContent = currentUser.online ? 'Online' : 'Offline';
-            }
-
-            // WebSocket Connection
-            function connectWebSocket() {
-                socket = io({
-                    query: {
-                        user_id: currentUser.id
-                    }
-                });
-
-                socket.on('connect', () => {
-                    console.log('Connected to NOS server');
-                    updateUserStatus(true);
-                });
-
-                socket.on('disconnect', () => {
-                    console.log('Disconnected from NOS server');
-                    updateUserStatus(false);
-                });
-
-                // Message events
-                socket.on('new_message', handleNewMessage);
-                socket.on('message_status', handleMessageStatus);
-                socket.on('typing', handleTyping);
-                socket.on('stop_typing', handleStopTyping);
-
-                // Call events
-                socket.on('incoming_call', handleIncomingCall);
-                socket.on('call_accepted', handleCallAccepted);
-                socket.on('call_rejected', handleCallRejected);
-                socket.on('call_ended', handleCallEnded);
-                socket.on('ice_candidate', handleIceCandidate);
-
-                // Group events
-                socket.on('group_updated', handleGroupUpdated);
-                socket.on('user_joined', handleUserJoined);
-                socket.on('user_left', handleUserLeft);
-
-                // Status events
-                socket.on('status_updated', handleStatusUpdated);
-                socket.on('status_viewed', handleStatusViewed);
-            }
-
-            function updateUserStatus(online) {
-                currentUser.online = online;
-                document.getElementById('userStatus').textContent = online ? 'Online' : 'Offline';
-                
-                if (socket && socket.connected) {
-                    socket.emit('user_status', {
-                        online: online,
-                        last_seen: new Date().toISOString()
-                    });
-                }
-            }
-
-            // Conversation Management
-            function loadConversations() {
-                fetch('/api/conversations')
-                    .then(response => response.json())
-                    .then(data => {
-                        conversations = data.conversations;
-                        renderConversationList(conversations);
-                    })
-                    .catch(error => {
-                        console.error('Error loading conversations:', error);
-                        // Load sample conversations for demo
-                        loadSampleConversations();
-                    });
-            }
-
-            function loadSampleConversations() {
-                conversations = [
-                    {
-                        id: 'general',
-                        name: 'General Chat',
-                        type: 'group',
-                        last_message: 'Welcome to NOS Messenger!',
-                        last_activity: new Date().toISOString(),
-                        unread_count: 0,
-                        avatar_text: 'GC',
-                        online: true
-                    },
-                    {
-                        id: 'support',
-                        name: 'NOS Support',
-                        type: 'user',
-                        last_message: 'How can we help you today?',
-                        last_activity: new Date().toISOString(),
-                        unread_count: 0,
-                        avatar_text: 'NS',
-                        online: true
-                    },
-                    {
-                        id: 'john',
-                        name: 'John Doe',
-                        type: 'user',
-                        last_message: 'See you at the meeting!',
-                        last_activity: new Date(Date.now() - 3600000).toISOString(),
-                        unread_count: 2,
-                        avatar_text: 'JD',
-                        online: false
-                    }
-                ];
-                renderConversationList(conversations);
-            }
-
-            function renderConversationList(conversations) {
-                const container = document.getElementById('conversationList');
-                container.innerHTML = conversations.map(conv => `
-                    <div class="conversation-item ${conv.id === currentConversation?.id ? 'active' : ''}" onclick="selectConversation('${conv.id}')">
-                        <div class="conversation-avatar">
-                            <span>${conv.avatar_text}</span>
-                            ${conv.online ? '<div class="online-indicator"></div>' : ''}
-                        </div>
-                        <div class="conversation-info">
-                            <div class="conversation-header">
-                                <div class="conversation-name">${conv.name}</div>
-                                <div class="conversation-time">${formatTime(conv.last_activity)}</div>
-                            </div>
-                            <div class="conversation-preview">
-                                ${conv.last_message}
-                                ${conv.unread_count > 0 ? `<span style="background: #ff4444; color: white; padding: 2px 6px; border-radius: 10px; font-size: 10px;">${conv.unread_count}</span>` : ''}
-                            </div>
-                        </div>
-                    </div>
-                `).join('');
-            }
-
-            function selectConversation(conversationId) {
-                const conversation = conversations.find(c => c.id === conversationId);
-                if (!conversation) return;
-
-                currentConversation = conversation;
-
-                // Update UI
-                document.getElementById('chatParticipantName').textContent = conversation.name;
-                document.getElementById('chatAvatar').querySelector('span').textContent = conversation.avatar_text;
-                document.getElementById('chatOnlineIndicator').style.display = conversation.online ? 'block' : 'none';
-                document.getElementById('chatParticipantStatus').textContent = conversation.online ? 'Online' : 'Offline';
-
-                // Show chat actions and input
-                document.getElementById('chatActions').style.display = 'flex';
-                document.getElementById('inputContainer').style.display = 'block';
-                document.getElementById('groupInfoButton').style.display = conversation.type === 'group' ? 'block' : 'none';
-
-                // Load messages
-                loadConversationMessages(conversationId);
-
-                // Update conversation list active state
-                document.querySelectorAll('.conversation-item').forEach(item => {
-                    item.classList.remove('active');
-                });
-                event.currentTarget.classList.add('active');
-
-                // Mark as read
-                if (conversation.unread_count > 0) {
-                    markConversationAsRead(conversationId);
-                }
-            }
-
-            function loadConversationMessages(conversationId) {
-                fetch(`/api/messages/${conversationId}`)
-                    .then(response => response.json())
-                    .then(data => {
-                        renderMessages(data.messages);
-                    })
-                    .catch(error => {
-                        console.error('Error loading messages:', error);
-                        // Load sample messages for demo
-                        loadSampleMessages();
-                    });
-            }
-
-            function loadSampleMessages() {
-                const messages = [
-                    {
-                        id: '1',
-                        conversation_id: currentConversation.id,
-                        user_id: 'system',
-                        message_type: 'text',
-                        content: 'Welcome to ' + currentConversation.name + '! Start chatting now.',
-                        timestamp: new Date().toISOString(),
-                        status: 'delivered'
-                    }
-                ];
-                renderMessages(messages);
-            }
-
-            function renderMessages(messages) {
-                const container = document.getElementById('chatMessages');
-                container.innerHTML = '';
-
-                if (messages.length === 0) {
-                    container.innerHTML = '<div style="text-align: center; color: var(--text-secondary); padding: 40px; font-size: 14px;">No messages yet. Start the conversation!</div>';
-                    return;
-                }
-
-                messages.forEach(message => {
-                    const isSent = message.user_id === currentUser.id;
-                    addMessageToUI(message, isSent);
-                });
-
-                container.scrollTop = container.scrollHeight;
-            }
-
-            // Message Handling
-            function sendMessage() {
-                const input = document.getElementById('messageInput');
-                const message = input.value.trim();
-
-                if (!message || !currentConversation) return;
-
-                const messageData = {
-                    id: generateId(),
-                    conversation_id: currentConversation.id,
-                    user_id: currentUser.id,
-                    message_type: 'text',
-                    content: message,
-                    timestamp: new Date().toISOString(),
-                    status: 'sent'
-                };
-
-                // Add to UI immediately
-                addMessageToUI(messageData, true);
-
-                // Clear input
-                input.value = '';
-                input.style.height = 'auto';
-                document.getElementById('sendButton').disabled = true;
-
-                // Send via WebSocket
-                if (socket) {
-                    socket.emit('send_message', messageData);
-                }
-
-                // Save to database
-                fetch('/api/send_message', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(messageData)
-                }).catch(error => {
-                    console.error('Error sending message:', error);
-                });
-
-                // Stop typing indicator
-                if (socket) {
-                    socket.emit('typing', {
-                        conversation_id: currentConversation.id,
-                        typing: false
-                    });
-                }
-            }
-
-            function handleNewMessage(data) {
-                if (data.conversation_id === currentConversation?.id) {
-                    addMessageToUI(data.message, false);
-                } else {
-                    // Update conversation list with new message
-                    updateConversationPreview(data.conversation_id, data.message);
-                }
-            }
-
-            function addMessageToUI(messageData, isSent) {
-                const messagesContainer = document.getElementById('chatMessages');
-                
-                // Remove placeholder if exists
-                const placeholder = messagesContainer.querySelector('div[style*="text-align: center"]');
-                if (placeholder) {
-                    placeholder.remove();
-                }
-
-                const messageDiv = document.createElement('div');
-                messageDiv.className = `message ${isSent ? 'sent' : 'received'}`;
-                messageDiv.innerHTML = `
-                    ${!isSent ? `
-                        <div class="message-header">
-                            <div class="message-sender">${messageData.sender || 'User'}</div>
-                            <div class="message-time">${formatTime(messageData.timestamp)}</div>
-                        </div>
-                    ` : ''}
-                    <div class="message-content">${messageData.content}</div>
-                    ${isSent ? `
-                        <div class="message-status">
-                            ${messageData.status === 'read' ? '✓✓' : messageData.status === 'delivered' ? '✓✓' : '✓'}
-                        </div>
-                    ` : ''}
-                `;
-
-                messagesContainer.appendChild(messageDiv);
-                messagesContainer.scrollTop = messagesContainer.scrollHeight;
-            }
-
-            // Voice Messages
-            function startVoiceRecording(e) {
-                if (!isRecording && currentConversation) {
-                    e.preventDefault();
-                    isRecording = true;
-                    recordingTime = 0;
-                    document.getElementById('voiceRecorder').style.display = 'block';
-                    
-                    recordingInterval = setInterval(() => {
-                        recordingTime++;
-                        const minutes = Math.floor(recordingTime / 60);
-                        const seconds = recordingTime % 60;
-                        document.getElementById('recordingTime').textContent = `${minutes}:${seconds.toString().padStart(2, '0')}`;
-                    }, 1000);
-
-                    startAudioRecording();
-                }
-            }
-
-            function stopVoiceRecording() {
-                if (isRecording) {
-                    isRecording = false;
-                    clearInterval(recordingInterval);
-                    document.getElementById('voiceRecorder').style.display = 'none';
-                    stopAudioRecording();
-                }
-            }
-
-            async function startAudioRecording() {
-                try {
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                    mediaRecorder = new MediaRecorder(stream);
-                    audioChunks = [];
-
-                    mediaRecorder.ondataavailable = (event) => {
-                        audioChunks.push(event.data);
-                    };
-
-                    mediaRecorder.onstop = async () => {
-                        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-                        await sendVoiceMessage(audioBlob);
-                        stream.getTracks().forEach(track => track.stop());
-                    };
-
-                    mediaRecorder.start();
-                } catch (error) {
-                    console.error('Error starting audio recording:', error);
-                    alert('Microphone access is required for voice messages');
-                    isRecording = false;
-                    document.getElementById('voiceRecorder').style.display = 'none';
-                    clearInterval(recordingInterval);
-                }
-            }
-
-            function stopAudioRecording() {
-                if (mediaRecorder && mediaRecorder.state === 'recording') {
-                    mediaRecorder.stop();
-                }
-            }
-
-            async function sendVoiceMessage(audioBlob) {
-                if (!currentConversation) return;
-
-                try {
-                    const formData = new FormData();
-                    formData.append('voice_message', audioBlob);
-                    formData.append('conversation_id', currentConversation.id);
-                    formData.append('duration', recordingTime);
-
-                    const response = await fetch('/send_voice_message', {
-                        method: 'POST',
-                        body: formData
-                    });
-
-                    const result = await response.json();
-                    if (result.success) {
-                        console.log('Voice message sent successfully');
-                    }
-                } catch (error) {
-                    console.error('Error sending voice message:', error);
-                }
-            }
-
-            // Voice and Video Calls
-            async function startVoiceCall() {
-                if (!currentConversation) return;
-                await startCall('voice');
-            }
-
-            async function startVideoCall() {
-                if (!currentConversation) return;
-                await startCall('video');
-            }
-
-            async function startCall(callType) {
-                try {
-                    localStream = await navigator.mediaDevices.getUserMedia({
-                        audio: true,
-                        video: callType === 'video'
-                    });
-
-                    peerConnection = new RTCPeerConnection(configuration);
-
-                    // Add local stream
-                    localStream.getTracks().forEach(track => {
-                        peerConnection.addTrack(track, localStream);
-                    });
-
-                    // Handle remote stream
-                    peerConnection.ontrack = (event) => {
-                        remoteStream = event.streams[0];
-                        document.getElementById('remoteVideo').srcObject = remoteStream;
-                    };
-
-                    // Handle ICE candidates
-                    peerConnection.onicecandidate = (event) => {
-                        if (event.candidate && socket) {
-                            socket.emit('ice_candidate', {
-                                target_conversation: currentConversation.id,
-                                candidate: event.candidate
-                            });
-                        }
-                    };
-
-                    // Create offer
-                    const offer = await peerConnection.createOffer();
-                    await peerConnection.setLocalDescription(offer);
-
-                    // Send call offer
-                    if (socket) {
-                        socket.emit('call_offer', {
-                            conversation_id: currentConversation.id,
-                            call_type: callType,
-                            offer: offer
-                        });
-                    }
-
-                    currentCall = {
-                        conversation: currentConversation.id,
-                        type: callType,
-                        direction: 'outgoing'
-                    };
-
-                    showCallInterface();
-                } catch (error) {
-                    console.error('Error starting call:', error);
-                    alert(`Error starting ${callType} call: ${error.message}`);
-                }
-            }
-
-            function handleIncomingCall(data) {
-                currentCall = {
-                    conversation: data.conversation_id,
-                    type: data.call_type,
-                    direction: 'incoming',
-                    offer: data.offer,
-                    caller: data.caller
-                };
-
-                document.getElementById('incomingCallerName').textContent = data.caller_name || 'Incoming Call';
-                document.getElementById('incomingCallType').textContent = data.call_type === 'video' ? 'Incoming Video Call' : 'Incoming Voice Call';
-                document.getElementById('incomingCall').style.display = 'flex';
-            }
-
-            async function answerCall(accept) {
-                document.getElementById('incomingCall').style.display = 'none';
-
-                if (!accept) {
-                    if (socket) {
-                        socket.emit('call_rejected', {
-                            conversation_id: currentCall.conversation
-                        });
-                    }
-                    currentCall = null;
-                    return;
-                }
-
-                try {
-                    localStream = await navigator.mediaDevices.getUserMedia({
-                        audio: true,
-                        video: currentCall.type === 'video'
-                    });
-
-                    peerConnection = new RTCPeerConnection(configuration);
-
-                    // Add local stream
-                    localStream.getTracks().forEach(track => {
-                        peerConnection.addTrack(track, localStream);
-                    });
-
-                    // Handle remote stream
-                    peerConnection.ontrack = (event) => {
-                        remoteStream = event.streams[0];
-                        document.getElementById('remoteVideo').srcObject = remoteStream;
-                    };
-
-                    // Handle ICE candidates
-                    peerConnection.onicecandidate = (event) => {
-                        if (event.candidate && socket) {
-                            socket.emit('ice_candidate', {
-                                target_conversation: currentCall.conversation,
-                                candidate: event.candidate
-                            });
-                        }
-                    };
-
-                    // Set remote description and create answer
-                    await peerConnection.setRemoteDescription(currentCall.offer);
-                    const answer = await peerConnection.createAnswer();
-                    await peerConnection.setLocalDescription(answer);
-
-                    // Send answer
-                    if (socket) {
-                        socket.emit('call_answer', {
-                            conversation_id: currentCall.conversation,
-                            answer: answer
-                        });
-                    }
-
-                    showCallInterface();
-                } catch (error) {
-                    console.error('Error answering call:', error);
-                    alert('Error answering call: ' + error.message);
-                }
-            }
-
-            function handleCallAccepted(data) {
-                if (peerConnection) {
-                    peerConnection.setRemoteDescription(data.answer);
-                }
-            }
-
-            function handleCallEnded() {
-                endCall();
-            }
-
-            function handleIceCandidate(data) {
-                if (peerConnection) {
-                    peerConnection.addIceCandidate(data.candidate);
-                }
-            }
-
-            function showCallInterface() {
-                document.getElementById('callInterface').style.display = 'flex';
-                document.getElementById('localVideo').srcObject = localStream;
-                document.getElementById('callParticipantName').textContent = currentConversation?.name || 'Call';
-                document.getElementById('callStatus').textContent = 'Connected';
-            }
-
-            function endCall() {
-                if (peerConnection) {
-                    peerConnection.close();
-                    peerConnection = null;
-                }
-
-                if (localStream) {
-                    localStream.getTracks().forEach(track => track.stop());
-                    localStream = null;
-                }
-
-                document.getElementById('callInterface').style.display = 'none';
-                document.getElementById('incomingCall').style.display = 'none';
-
-                if (socket && currentCall) {
-                    socket.emit('end_call', {
-                        conversation_id: currentCall.conversation
-                    });
-                }
-
-                currentCall = null;
-            }
-
-            function toggleMute() {
-                if (localStream) {
-                    const audioTrack = localStream.getAudioTracks()[0];
-                    audioTrack.enabled = !audioTrack.enabled;
-                    document.getElementById('muteButton').style.background = audioTrack.enabled ? 'rgba(255,255,255,0.2)' : '#ff4444';
-                }
-            }
-
-            function toggleVideo() {
-                if (localStream) {
-                    const videoTrack = localStream.getVideoTracks()[0];
-                    if (videoTrack) {
-                        videoTrack.enabled = !videoTrack.enabled;
-                        document.getElementById('videoButton').style.background = videoTrack.enabled ? 'rgba(255,255,255,0.2)' : '#ff4444';
-                    }
-                }
-            }
-
-            function toggleSpeaker() {
-                // Toggle speaker phone (would need additional audio context)
-                alert('Speaker toggle would be implemented here');
-            }
-
-            // Status Updates
-            function loadStatusUpdates() {
-                fetch('/api/status_updates')
-                    .then(response => response.json())
-                    .then(data => {
-                        statusUpdates = data.status_updates;
-                        renderStatusList();
-                    })
-                    .catch(error => {
-                        console.error('Error loading status updates:', error);
-                    });
-            }
-
-            function renderStatusList() {
-                // This would render the status list in the status tab
-            }
-
-            function showStatusView() {
-                document.getElementById('statusView').style.display = 'block';
-                // Load and display status updates
-            }
-
-            // Utility Functions
-            function generateId() {
-                return Date.now().toString() + Math.random().toString(36).substr(2, 9);
-            }
-
-            function formatTime(timestamp) {
-                const date = new Date(timestamp);
-                const now = new Date();
-                const diff = now - date;
-
-                if (diff < 60000) return 'Just now';
-                if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
-                if (diff < 86400000) return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                return date.toLocaleDateString();
-            }
-
-            function getInitials(name) {
-                return name.split(' ').map(n => n[0]).join('').toUpperCase().substring(0, 2);
-            }
-
-            function switchTab(tabName) {
-                // Update tab UI
-                document.querySelectorAll('.sidebar-tab').forEach(tab => {
-                    tab.classList.remove('active');
-                });
-                event.target.classList.add('active');
-
-                // Load appropriate content
-                switch(tabName) {
-                    case 'chats':
-                        loadConversations();
-                        break;
-                    case 'status':
-                        loadStatusUpdates();
-                        break;
-                    case 'calls':
-                        loadCallHistory();
-                        break;
-                    case 'contacts':
-                        loadContacts();
-                        break;
-                }
-            }
-
-            function searchConversations(query) {
-                const filtered = conversations.filter(conv => 
-                    conv.name.toLowerCase().includes(query.toLowerCase()) ||
-                    conv.last_message.toLowerCase().includes(query.toLowerCase())
-                );
-                renderConversationList(filtered);
-            }
-
-            function searchInChat() {
-                const query = prompt('Search in conversation:');
-                if (query) {
-                    // Highlight and scroll to matching messages
-                    alert(`Would search for: ${query}`);
-                }
-            }
-
-            function newChat() {
-                const username = prompt('Enter username or phone number:');
-                if (username) {
-                    // Create new conversation
-                    alert(`Would start chat with: ${username}`);
-                }
-            }
-
-            function showSettings() {
-                document.getElementById('settingsModal').style.display = 'flex';
-            }
-
-            function closeSettings() {
-                document.getElementById('settingsModal').style.display = 'none';
-            }
-
-            function openProfileSettings() {
-                alert('Profile settings would open here');
-            }
-
-            function attachFile() {
-                const input = document.createElement('input');
-                input.type = 'file';
-                input.onchange = (e) => {
-                    const file = e.target.files[0];
-                    if (file) {
-                        sendFileMessage(file);
-                    }
-                };
-                input.click();
-            }
-
-            function attachImage() {
-                const input = document.createElement('input');
-                input.type = 'file';
-                input.accept = 'image/*';
-                input.onchange = (e) => {
-                    const file = e.target.files[0];
-                    if (file) {
-                        sendImageMessage(file);
-                    }
-                };
-                input.click();
-            }
-
-            function attachContact() {
-                alert('Contact sharing would be implemented here');
-            }
-
-            function attachLocation() {
-                if (navigator.geolocation) {
-                    navigator.geolocation.getCurrentPosition((position) => {
-                        const { latitude, longitude } = position.coords;
-                        sendLocationMessage(latitude, longitude);
-                    }, (error) => {
-                        alert('Unable to get location: ' + error.message);
-                    });
-                } else {
-                    alert('Geolocation is not supported by this browser.');
-                }
-            }
-
-            function sendFileMessage(file) {
-                const formData = new FormData();
-                formData.append('file', file);
-                formData.append('conversation_id', currentConversation.id);
-
-                fetch('/send_file', {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        console.log('File sent successfully');
-                    }
-                })
-                .catch(error => {
-                    console.error('Error sending file:', error);
-                });
-            }
-
-            function sendImageMessage(file) {
-                const formData = new FormData();
-                formData.append('image', file);
-                formData.append('conversation_id', currentConversation.id);
-
-                fetch('/send_image', {
-                    method: 'POST',
-                    body: formData
-                })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        console.log('Image sent successfully');
-                    }
-                })
-                .catch(error => {
-                    console.error('Error sending image:', error);
-                });
-            }
-
-            function sendLocationMessage(latitude, longitude) {
-                const messageData = {
-                    id: generateId(),
-                    conversation_id: currentConversation.id,
-                    user_id: currentUser.id,
-                    message_type: 'location',
-                    content: `Location: ${latitude}, ${longitude}`,
-                    timestamp: new Date().toISOString(),
-                    status: 'sent',
-                    location: { latitude, longitude }
-                };
-
-                if (socket) {
-                    socket.emit('send_message', messageData);
-                }
-            }
-
-            function logout() {
-                if (confirm('Are you sure you want to log out?')) {
-                    localStorage.removeItem('nosUser');
-                    location.reload();
-                }
-            }
-
-            // Initialize the app when page loads
-            document.addEventListener('DOMContentLoaded', initApp);
+                initApp();
+            });
         </script>
     </body>
     </html>
-    ''')
+    '''
 
 # API Routes
-@app.route('/register', methods=['POST'])
-def register():
-    try:
-        data = request.get_json()
-        username = data.get('username', '').strip()
-        phone_number = data.get('phone_number', '').strip()
-
-        if not username:
-            return jsonify({'success': False, 'error': 'Username is required'})
-
-        # Check if user already exists
-        existing_user = db.get_user_by_username(username)
-        if existing_user:
-            return jsonify({'success': True, 'user': existing_user})
-
-        user_id = str(uuid.uuid4())[:8]
-        user_data = {
-            'id': user_id,
-            'username': username,
-            'phone_number': phone_number,
-            'display_name': username,
-            'status_text': 'Hey there! I am using NOS',
-            'online': True,
-            'last_seen': datetime.now().isoformat(),
-            'created_at': datetime.now().isoformat(),
-            'privacy_settings': {
-                'last_seen': 'everyone',
-                'profile_photo': 'everyone',
-                'status': 'everyone'
-            },
-            'blocked_users': [],
-            'theme': 'light',
-            'language': 'en'
-        }
-
-        db.save_user(user_data)
-        session['user_id'] = user_id
-
-        return jsonify({
-            'success': True,
-            'user': user_data
-        })
-
-    except Exception as e:
-        logger.error(f"Registration error: {e}")
-        return jsonify({'success': False, 'error': 'Registration failed'})
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    data = request.get_json()
+    username = data.get('username', '').strip()
+    
+    if not username:
+        return jsonify({'success': False, 'error': 'Username is required'})
+    
+    db = get_db()
+    
+    # Check if user exists
+    user = db.execute('SELECT * FROM users WHERE username = ?', (username,)).fetchone()
+    
+    if not user:
+        # Create new user
+        user_id = str(uuid.uuid4())
+        user_code = generate_user_code()
+        avatar_color = get_avatar_color(user_id)
+        
+        db.execute('INSERT INTO users (id, username, display_name, user_code, online, last_seen, avatar_color, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                   (user_id, username, username, user_code, 1, datetime.now().isoformat(), avatar_color, datetime.now().isoformat()))
+        db.commit()
+        user = db.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
+    else:
+        # Update online status
+        db.execute('UPDATE users SET online = 1, last_seen = ? WHERE id = ?
+                           db.execute('UPDATE users SET online = 1, last_seen = ? WHERE id = ?', 
+                   (datetime.now().isoformat(), user['id']))
+        db.commit()
+        user = db.execute('SELECT * FROM users WHERE id = ?', (user['id'],)).fetchone()
+    
+    user_dict = dict(user)
+    db.close()
+    return jsonify({'success': True, 'user': user_dict})
 
 @app.route('/api/conversations')
-def get_conversations():
-    user_id = request.args.get('user_id') or session.get('user_id')
+def api_conversations():
+    user_id = request.args.get('user_id')
     if not user_id:
-        return jsonify({'success': False, 'error': 'Not authenticated'})
-
-    # Get user's groups
-    groups = db.get_user_groups(user_id)
+        return jsonify({'success': False, 'error': 'User ID required'})
     
-    # Get user's contacts
-    contacts = db.get_user_contacts(user_id)
+    db = get_db()
     
-    conversations = []
+    # Get user's conversations
+    conversations = db.execute('''
+        SELECT c.*, 
+               (SELECT content FROM messages WHERE conversation_id = c.id ORDER BY timestamp DESC LIMIT 1) as last_message
+        FROM conversations c
+        JOIN conversation_participants cp ON c.id = cp.conversation_id
+        WHERE cp.user_id = ?
+        ORDER BY (SELECT timestamp FROM messages WHERE conversation_id = c.id ORDER BY timestamp DESC LIMIT 1) DESC
+    ''', (user_id,)).fetchall()
     
-    # Add groups to conversations
-    for group in groups:
-        # Get last message for the group
-        messages = db.get_conversation_messages(group['id'], limit=1)
-        last_message = messages[0] if messages else None
-        
-        conversations.append({
-            'id': group['id'],
-            'name': group['name'],
-            'type': 'group',
-            'last_message': last_message['content'] if last_message else 'No messages yet',
-            'last_activity': last_message['timestamp'] if last_message else group['created_at'],
-            'unread_count': 0,
-            'avatar_text': ''.join([word[0] for word in group['name'].split()[:2]]).upper(),
-            'online': True
-        })
+    result = []
+    for conv in conversations:
+        conv_dict = dict(conv)
+        # Get conversation participants for individual chats
+        if not conv_dict['is_group']:
+            participants = db.execute('''
+                SELECT u.display_name, u.avatar_color 
+                FROM conversation_participants cp
+                JOIN users u ON cp.user_id = u.id
+                WHERE cp.conversation_id = ? AND cp.user_id != ?
+            ''', (conv_dict['id'], user_id)).fetchone()
+            if participants:
+                conv_dict['name'] = participants['display_name']
+                conv_dict['avatar_color'] = participants['avatar_color']
+        result.append(conv_dict)
     
-    # Add contacts to conversations
-    for contact in contacts:
-        # Create conversation ID (combination of user IDs)
-        conversation_id = f"private_{min(user_id, contact['id'])}_{max(user_id, contact['id'])}"
-        
-        # Get last message for the conversation
-        messages = db.get_conversation_messages(conversation_id, limit=1)
-        last_message = messages[0] if messages else None
-        
-        conversations.append({
-            'id': conversation_id,
-            'name': contact['display_name'] or contact['username'],
-            'type': 'user',
-            'last_message': last_message['content'] if last_message else 'Start a conversation',
-            'last_activity': last_message['timestamp'] if last_message else contact['last_seen'],
-            'unread_count': 0,
-            'avatar_text': get_initials(contact['display_name'] or contact['username']),
-            'online': contact['online']
-        })
-    
-    return jsonify({'success': True, 'conversations': conversations})
+    db.close()
+    return jsonify({'success': True, 'conversations': result})
 
 @app.route('/api/messages/<conversation_id>')
-def get_messages(conversation_id):
-    messages = db.get_conversation_messages(conversation_id, limit=100)
-    return jsonify({'success': True, 'messages': messages})
+def api_messages(conversation_id):
+    db = get_db()
+    messages = db.execute('''
+        SELECT m.*, u.display_name 
+        FROM messages m 
+        JOIN users u ON m.user_id = u.id 
+        WHERE m.conversation_id = ? 
+        ORDER BY m.timestamp
+    ''', (conversation_id,)).fetchall()
+    
+    result = [dict(msg) for msg in messages]
+    db.close()
+    return jsonify({'success': True, 'messages': result})
 
 @app.route('/api/send_message', methods=['POST'])
 def api_send_message():
-    try:
-        data = request.get_json()
-        db.save_message(data)
+    data = request.get_json()
+    
+    db = get_db()
+    db.execute('INSERT INTO messages (id, conversation_id, user_id, content, timestamp) VALUES (?, ?, ?, ?, ?)',
+               (data['id'], data['conversation_id'], data['user_id'], data['content'], data['timestamp']))
+    db.commit()
+    
+    # Get conversation participants
+    participants = db.execute('SELECT user_id FROM conversation_participants WHERE conversation_id = ?', 
+                             (data['conversation_id'],)).fetchall()
+    
+    # Broadcast to participants
+    for participant in participants:
+        if participant['user_id'] != data['user_id']:  # Don't send to sender
+            socketio.emit('new_message', {
+                'conversation_id': data['conversation_id'],
+                'message': data
+            }, room=participant['user_id'])
+    
+    db.close()
+    return jsonify({'success': True})
+
+@app.route('/api/friends')
+def api_friends():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({'success': False, 'error': 'User ID required'})
+    
+    db = get_db()
+    friends = db.execute('''
+        SELECT u.id, u.username, u.display_name, u.user_code, u.online, u.avatar_color
+        FROM friends f
+        JOIN users u ON f.friend_id = u.id
+        WHERE f.user_id = ?
+    ''', (user_id,)).fetchall()
+    
+    result = [dict(friend) for friend in friends]
+    db.close()
+    return jsonify({'success': True, 'friends': result})
+
+@app.route('/api/friend_requests')
+def api_friend_requests():
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({'success': False, 'error': 'User ID required'})
+    
+    db = get_db()
+    requests = db.execute('''
+        SELECT fr.*, u.display_name as from_display_name, u.avatar_color as from_avatar_color
+        FROM friend_requests fr
+        JOIN users u ON fr.from_user_id = u.id
+        WHERE fr.to_user_id = ? AND fr.status = 'pending'
+    ''', (user_id,)).fetchall()
+    
+    result = [dict(req) for req in requests]
+    db.close()
+    return jsonify({'success': True, 'requests': result})
+
+@app.route('/api/send_friend_request', methods=['POST'])
+def api_send_friend_request():
+    data = request.get_json()
+    from_user_id = data.get('from_user_id')
+    to_user_code = data.get('to_user_code')
+    
+    if not from_user_id or not to_user_code:
+        return jsonify({'success': False, 'error': 'Missing data'})
+    
+    db = get_db()
+    
+    # Find target user by code
+    to_user = db.execute('SELECT * FROM users WHERE user_code = ?', (to_user_code,)).fetchone()
+    if not to_user:
+        return jsonify({'success': False, 'error': 'User not found'})
+    
+    if from_user_id == to_user['id']:
+        return jsonify({'success': False, 'error': 'Cannot add yourself'})
+    
+    # Check if already friends
+    existing_friend = db.execute('SELECT * FROM friends WHERE user_id = ? AND friend_id = ?', 
+                                (from_user_id, to_user['id'])).fetchone()
+    if existing_friend:
+        return jsonify({'success': False, 'error': 'Already friends'})
+    
+    # Check if request already exists
+    existing_request = db.execute('SELECT * FROM friend_requests WHERE from_user_id = ? AND to_user_id = ? AND status = "pending"',
+                                 (from_user_id, to_user['id'])).fetchone()
+    if existing_request:
+        return jsonify({'success': False, 'error': 'Friend request already sent'})
+    
+    # Create friend request
+    request_id = str(uuid.uuid4())
+    db.execute('INSERT INTO friend_requests (id, from_user_id, to_user_id, status, created_at) VALUES (?, ?, ?, "pending", ?)',
+               (request_id, from_user_id, to_user['id'], datetime.now().isoformat()))
+    db.commit()
+    
+    # Notify target user
+    from_user = db.execute('SELECT * FROM users WHERE id = ?', (from_user_id,)).fetchone()
+    socketio.emit('friend_request', {
+        'request_id': request_id,
+        'from_user': dict(from_user)
+    }, room=to_user['id'])
+    
+    db.close()
+    return jsonify({'success': True, 'message': 'Friend request sent'})
+
+@app.route('/api/respond_friend_request', methods=['POST'])
+def api_respond_friend_request():
+    data = request.get_json()
+    request_id = data.get('request_id')
+    accept = data.get('accept', False)
+    
+    db = get_db()
+    
+    # Get request details
+    request_data = db.execute('SELECT * FROM friend_requests WHERE id = ?', (request_id,)).fetchone()
+    if not request_data:
+        return jsonify({'success': False, 'error': 'Request not found'})
+    
+    if accept:
+        # Add to friends table both ways
+        db.execute('INSERT OR IGNORE INTO friends (user_id, friend_id, created_at) VALUES (?, ?, ?)',
+                  (request_data['from_user_id'], request_data['to_user_id'], datetime.now().isoformat()))
+        db.execute('INSERT OR IGNORE INTO friends (user_id, friend_id, created_at) VALUES (?, ?, ?)',
+                  (request_data['to_user_id'], request_data['from_user_id'], datetime.now().isoformat()))
         
-        # Broadcast to other users in the conversation
-        socketio.emit('new_message', {
-            'conversation_id': data['conversation_id'],
-            'message': data
-        })
+        # Notify the requester
+        new_friend = db.execute('SELECT * FROM users WHERE id = ?', (request_data['to_user_id'],)).fetchone()
+        socketio.emit('friend_request_accepted', {
+            'friend': dict(new_friend)
+        }, room=request_data['from_user_id'])
+    
+    # Update request status
+    db.execute('UPDATE friend_requests SET status = ? WHERE id = ?', 
+               ('accepted' if accept else 'declined', request_id))
+    db.commit()
+    db.close()
+    
+    return jsonify({'success': True, 'message': 'Friend request ' + ('accepted' if accept else 'declined')})
+
+@app.route('/api/create_conversation', methods=['POST'])
+def api_create_conversation():
+    data = request.get_json()
+    user_id = data.get('user_id')
+    friend_id = data.get('friend_id')
+    
+    if not user_id or not friend_id:
+        return jsonify({'success': False, 'error': 'Missing data'})
+    
+    db = get_db()
+    
+    # Check if conversation already exists
+    existing_conv = db.execute('''
+        SELECT c.id FROM conversations c
+        JOIN conversation_participants cp1 ON c.id = cp1.conversation_id
+        JOIN conversation_participants cp2 ON c.id = cp2.conversation_id
+        WHERE cp1.user_id = ? AND cp2.user_id = ? AND c.is_group = 0
+    ''', (user_id, friend_id)).fetchone()
+    
+    if existing_conv:
+        db.close()
+        return jsonify({'success': True, 'conversation_id': existing_conv['id']})
+    
+    # Create new conversation
+    conv_id = str(uuid.uuid4())
+    friend_user = db.execute('SELECT display_name FROM users WHERE id = ?', (friend_id,)).fetchone()
+    conv_name = f"Chat with {friend_user['display_name']}"
+    
+    db.execute('INSERT INTO conversations (id, name, is_group, created_by, created_at) VALUES (?, ?, ?, ?, ?)',
+               (conv_id, conv_name, 0, user_id, datetime.now().isoformat()))
+    
+    # Add participants
+    db.execute('INSERT INTO conversation_participants (conversation_id, user_id) VALUES (?, ?)', (conv_id, user_id))
+    db.execute('INSERT INTO conversation_participants (conversation_id, user_id) VALUES (?, ?)', (conv_id, friend_id))
+    
+    db.commit()
+    db.close()
+    
+    return jsonify({'success': True, 'conversation_id': conv_id})
+
+@app.route('/api/start_call', methods=['POST'])
+def api_start_call():
+    data = request.get_json()
+    from_user_id = data.get('from_user_id')
+    conversation_id = data.get('conversation_id')
+    call_type = data.get('call_type', 'voice')
+    
+    db = get_db()
+    
+    # Get conversation participants
+    participants = db.execute('SELECT user_id FROM conversation_participants WHERE conversation_id = ? AND user_id != ?',
+                             (conversation_id, from_user_id)).fetchall()
+    
+    if not participants:
+        return jsonify({'success': False, 'error': 'No participants found'})
+    
+    # Create call record
+    call_id = str(uuid.uuid4())
+    db.execute('INSERT INTO active_calls (id, from_user_id, to_user_id, conversation_id, call_type, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+               (call_id, from_user_id, participants[0]['user_id'], conversation_id, call_type, 'ringing', datetime.now().isoformat()))
+    db.commit()
+    
+    # Get caller info
+    caller = db.execute('SELECT * FROM users WHERE id = ?', (from_user_id,)).fetchone()
+    
+    # Notify recipient
+    socketio.emit('incoming_call', {
+        'call': {
+            'id': call_id,
+            'type': call_type,
+            'conversation_id': conversation_id
+        },
+        'caller': dict(caller)
+    }, room=participants[0]['user_id'])
+    
+    db.close()
+    return jsonify({'success': True, 'call': {'id': call_id, 'type': call_type}})
+
+@app.route('/api/answer_call', methods=['POST'])
+def api_answer_call():
+    data = request.get_json()
+    call_id = data.get('call_id')
+    accept = data.get('accept', False)
+    
+    db = get_db()
+    
+    call = db.execute('SELECT * FROM active_calls WHERE id = ?', (call_id,)).fetchone()
+    if not call:
+        return jsonify({'success': False, 'error': 'Call not found'})
+    
+    if accept:
+        db.execute('UPDATE active_calls SET status = ? WHERE id = ?', ('active', call_id))
+        # Notify caller
+        socketio.emit('call_accepted', {
+            'call_id': call_id
+        }, room=call['from_user_id'])
+    else:
+        db.execute('UPDATE active_calls SET status = ? WHERE id = ?', ('declined', call_id))
+        # Notify caller
+        socketio.emit('call_ended', {
+            'call_id': call_id
+        }, room=call['from_user_id'])
+    
+    db.commit()
+    db.close()
+    return jsonify({'success': True})
+
+@app.route('/api/end_call', methods=['POST'])
+def api_end_call():
+    data = request.get_json()
+    call_id = data.get('call_id')
+    
+    db = get_db()
+    
+    call = db.execute('SELECT * FROM active_calls WHERE id = ?', (call_id,)).fetchone()
+    if call:
+        # Notify other participant
+        other_user = call['to_user_id']
+        socketio.emit('call_ended', {
+            'call_id': call_id
+        }, room=other_user)
         
-        return jsonify({'success': True})
-    except Exception as e:
-        logger.error(f"Error sending message: {e}")
-        return jsonify({'success': False, 'error': 'Failed to send message'})
+        db.execute('DELETE FROM active_calls WHERE id = ?', (call_id,))
+        db.commit()
+    
+    db.close()
+    return jsonify({'success': True})
 
-@app.route('/send_voice_message', methods=['POST'])
-def send_voice_message():
-    try:
-        if 'voice_message' not in request.files:
-            return jsonify({'success': False, 'error': 'No voice message'})
-
-        voice_file = request.files['voice_message']
-        conversation_id = request.form.get('conversation_id')
-        duration = request.form.get('duration', 0)
-        user_id = session.get('user_id')
-
-        if not user_id:
-            return jsonify({'success': False, 'error': 'Not authenticated'})
-
-        user = db.get_user(user_id)
-        if not user:
-            return jsonify({'success': False, 'error': 'User not found'})
-
-        # Save voice file
-        filename = f"voice_{uuid.uuid4()}.wav"
-        filepath = os.path.join('uploads/voice', filename)
-        voice_file.save(filepath)
-
-        # Create message
-        message_data = {
-            'id': str(uuid.uuid4()),
-            'conversation_id': conversation_id,
-            'user_id': user_id,
-            'message_type': 'voice',
-            'file_path': filepath,
-            'duration': duration,
-            'timestamp': datetime.now().isoformat(),
-            'status': 'sent'
-        }
-
-        db.save_message(message_data)
-
-        # Broadcast message
-        socketio.emit('new_message', {
-            'conversation_id': conversation_id,
-            'message': message_data
-        })
-
-        return jsonify({'success': True})
-
-    except Exception as e:
-        logger.error(f"Voice message error: {e}")
-        return jsonify({'success': False, 'error': 'Failed to send voice message'})
-
-@app.route('/send_file', methods=['POST'])
-def send_file():
-    try:
-        if 'file' not in request.files:
-            return jsonify({'success': False, 'error': 'No file'})
-
-        file = request.files['file']
-        conversation_id = request.form.get('conversation_id')
-        user_id = session.get('user_id')
-
-        if not user_id:
-            return jsonify({'success': False, 'error': 'Not authenticated'})
-
-        filename = secure_filename(file.filename)
-        filepath = os.path.join('uploads/documents', f"{uuid.uuid4()}_{filename}")
-        file.save(filepath)
-
-        message_data = {
-            'id': str(uuid.uuid4()),
-            'conversation_id': conversation_id,
-            'user_id': user_id,
-            'message_type': 'file',
-            'content': filename,
-            'file_path': filepath,
-            'file_size': os.path.getsize(filepath),
-            'timestamp': datetime.now().isoformat(),
-            'status': 'sent'
-        }
-
-        db.save_message(message_data)
-        socketio.emit('new_message', {
-            'conversation_id': conversation_id,
-            'message': message_data
-        })
-
-        return jsonify({'success': True})
-
-    except Exception as e:
-        logger.error(f"File send error: {e}")
-        return jsonify({'success': False, 'error': 'Failed to send file'})
-
-@app.route('/send_image', methods=['POST'])
-def send_image():
-    try:
-        if 'image' not in request.files:
-            return jsonify({'success': False, 'error': 'No image'})
-
-        image_file = request.files['image']
-        conversation_id = request.form.get('conversation_id')
-        user_id = session.get('user_id')
-
-        if not user_id:
-            return jsonify({'success': False, 'error': 'Not authenticated'})
-
-        filename = f"image_{uuid.uuid4()}.jpg"
-        filepath = os.path.join('uploads/images', filename)
-        image_file.save(filepath)
-
-        # Create thumbnail
-        try:
-            with Image.open(filepath) as img:
-                img.thumbnail((200, 200))
-                thumbnail_path = os.path.join('uploads/images', f"thumb_{filename}")
-                img.save(thumbnail_path, 'JPEG')
-        except Exception as e:
-            logger.error(f"Thumbnail creation error: {e}")
-            thumbnail_path = None
-
-        message_data = {
-            'id': str(uuid.uuid4()),
-            'conversation_id': conversation_id,
-            'user_id': user_id,
-            'message_type': 'image',
-            'content': 'Image',
-            'file_path': filepath,
-            'thumbnail': thumbnail_path,
-            'file_size': os.path.getsize(filepath),
-            'timestamp': datetime.now().isoformat(),
-            'status': 'sent'
-        }
-
-        db.save_message(message_data)
-        socketio.emit('new_message', {
-            'conversation_id': conversation_id,
-            'message': message_data
-        })
-
-        return jsonify({'success': True})
-
-    except Exception as e:
-        logger.error(f"Image send error: {e}")
-        return jsonify({'success': False, 'error': 'Failed to send image'})
-
-@app.route('/api/status_updates')
-def get_status_updates():
-    # This would return the user's status updates and contacts' statuses
-    return jsonify({'success': True, 'status_updates': []})
-
-# WebSocket Events
+# WebSocket events
 @socketio.on('connect')
 def handle_connect():
     user_id = request.args.get('user_id')
     if user_id:
-        user = db.get_user(user_id)
-        if user:
-            user['online'] = True
-            user['last_seen'] = datetime.now().isoformat()
-            db.save_user(user)
-            logger.info(f"User {user['username']} connected")
+        join_room(user_id)
+        db = get_db()
+        db.execute('UPDATE users SET online = 1 WHERE id = ?', (user_id,))
+        db.commit()
+        db.close()
+        print(f"User {user_id} connected")
 
 @socketio.on('disconnect')
 def handle_disconnect():
     user_id = request.args.get('user_id')
     if user_id:
-        user = db.get_user(user_id)
-        if user:
-            user['online'] = False
-            user['last_seen'] = datetime.now().isoformat()
-            db.save_user(user)
-            logger.info(f"User {user['username']} disconnected")
+        db = get_db()
+        db.execute('UPDATE users SET online = 0 WHERE id = ?', (user_id,))
+        db.commit()
+        db.close()
+        print(f"User {user_id} disconnected")
 
 @socketio.on('send_message')
 def handle_send_message(data):
-    # Save message to database
-    db.save_message(data)
-    
-    # Broadcast to all users in the conversation
-    socketio.emit('new_message', {
-        'conversation_id': data['conversation_id'],
-        'message': data
-    })
+    # Broadcast to conversation participants (already handled in API)
+    pass
 
-@socketio.on('typing')
-def handle_typing(data):
-    # Broadcast typing indicator to other users in the conversation
-    socketio.emit('typing', {
-        'conversation_id': data['conversation_id'],
-        'user_id': data.get('user_id'),
-        'typing': data['typing']
-    }, room=data['conversation_id'])
-
-@socketio.on('call_offer')
-def handle_call_offer(data):
-    # Broadcast call offer to the conversation
-    socketio.emit('incoming_call', {
-        'conversation_id': data['conversation_id'],
-        'call_type': data['call_type'],
-        'offer': data['offer'],
-        'caller': data.get('caller')
-    }, room=data['conversation_id'])
-
-@socketio.on('call_answer')
-def handle_call_answer(data):
-    # Broadcast call answer
-    socketio.emit('call_accepted', {
-        'conversation_id': data['conversation_id'],
-        'answer': data['answer']
-    }, room=data['conversation_id'])
-
-@socketio.on('end_call')
-def handle_end_call(data):
-    # Broadcast call end
-    socketio.emit('call_ended', {
-        'conversation_id': data['conversation_id']
-    }, room=data['conversation_id'])
-
-@socketio.on('ice_candidate')
-def handle_ice_candidate(data):
-    # Broadcast ICE candidate
-    socketio.emit('ice_candidate', {
-        'conversation_id': data['target_conversation'],
-        'candidate': data['candidate']
-    }, room=data['target_conversation'])
-
-# Utility function
-def get_initials(name):
-    return ''.join([word[0] for word in name.split()[:2]]).upper()
+@socketio.on('user_status')
+def handle_user_status(data):
+    # Update user status
+    user_id = request.args.get('user_id')
+    if user_id:
+        db = get_db()
+        db.execute('UPDATE users SET online = ? WHERE id = ?', (data['online'], user_id))
+        db.commit()
+        db.close()
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    # Use this for production
     socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
